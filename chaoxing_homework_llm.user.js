@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.11
+// @version      1.0.12
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -1401,12 +1401,13 @@
     for (let i = 0; i < questions.length; i += cfg.batchSize) {
       batches.push(questions.slice(i, i + cfg.batchSize));
     }
-    let ok = 0, fail = 0;
+    let ok = 0, fail = 0, aborted = false;
     const allAnswers = [];
     const pending = runPooled(batches, 4, batch => askLLM(batch));
     for (let bi = 0; bi < batches.length; bi++) {
       if (!isRunning() && allowAfterAction) {
         log('运行已停止，退出答题', 'warn');
+        aborted = true;
         break;
       }
       touchRunning(false);
@@ -1428,6 +1429,7 @@
       for (let i = 0; i < batch.length; i++) {
         if (!isRunning() && allowAfterAction) {
           log('运行已停止，退出当前批次', 'warn');
+          aborted = true;
           break;
         }
         const q = batch[i];
@@ -1446,11 +1448,15 @@
         }
         await sleep(cfg.delayMs);
       }
+      if (aborted) break;
     }
     W.__cxllm_last_answers = allAnswers;
     log(`填题完成：成功 ${ok}，失败/未填 ${fail}`, fail ? 'warn' : 'ok');
     if (allowAfterAction) {
-      if (fail > 0) {
+      if (aborted) {
+        log('运行被中途停止，已阻止自动提交/保存，请手动检查后再操作。', 'error');
+        setRunning(false);
+      } else if (fail > 0) {
         log('存在未确认选中的题目，已阻止自动提交，请检查后手动提交或重试。', 'error');
         setRunning(false);
       } else {
@@ -1899,18 +1905,29 @@
     return true;
   }
 
+  let controllerBusy = false;
+
   async function runController() {
-    touchRunning(false);
-    try { W.confirm = () => true; } catch (_) {}
-    await sleep(800);
-    if (ensureUnfinishedListView()) return;
-    const qs = extractQuestions();
-    if (qs.length) {
-      await answerCurrentPage(true);
+    if (controllerBusy) {
+      log('已有一个运行实例在执行，忽略本次触发', 'warn');
       return;
     }
-    if (clickStartButtonIfPresent()) return;
-    await enterNextWork();
+    controllerBusy = true;
+    try {
+      touchRunning(false);
+      try { W.confirm = () => true; } catch (_) {}
+      await sleep(800);
+      if (ensureUnfinishedListView()) return;
+      const qs = extractQuestions();
+      if (qs.length) {
+        await answerCurrentPage(true);
+        return;
+      }
+      if (clickStartButtonIfPresent()) return;
+      await enterNextWork();
+    } finally {
+      controllerBusy = false;
+    }
   }
 
   function debugQuestion(index = 1) {
