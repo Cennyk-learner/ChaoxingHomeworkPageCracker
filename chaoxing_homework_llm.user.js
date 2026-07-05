@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.13
+// @version      1.0.14
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -282,7 +282,7 @@
         <label>模型名</label>
         <input id="cxllm-model" placeholder="如 gpt-4.1 / claude-3-5-sonnet-latest">
         <div class="row">
-          <div><label>每批题数</label><input id="cxllm-batchSize" type="number" min="1" max="30"></div>
+          <div><label>每批题数</label><input id="cxllm-batchSize" type="number" min="1" max="100"></div>
           <div><label>填题间隔(ms)</label><input id="cxllm-delayMs" type="number" min="0" max="10000"></div>
         </div>
         <div class="cxllm-toggles">
@@ -342,8 +342,8 @@
     });
 
     D.getElementById('cxllm-save').onclick = () => {
-      savePanelCfg();
-      log('配置已保存', 'ok');
+      const saved = savePanelCfg();
+      log(`配置已保存：每批题数=${saved.batchSize}，填题间隔=${saved.delayMs}ms`, 'ok');
     };
     D.getElementById('cxllm-start').onclick = async () => {
       savePanelCfg();
@@ -369,17 +369,19 @@
   function savePanelCfg() {
     const v = id => D.getElementById(id)?.value ?? '';
     const c = id => !!D.getElementById(id)?.checked;
-    setCfg({
+    const cfg = {
       provider: v('cxllm-provider'),
       apiUrl: v('cxllm-apiUrl').trim(),
       apiKey: v('cxllm-apiKey').trim(),
       model: v('cxllm-model').trim(),
-      batchSize: Math.max(1, Math.min(30, parseInt(v('cxllm-batchSize'), 10) || 8)),
+      batchSize: Math.max(1, Math.min(100, parseInt(v('cxllm-batchSize'), 10) || 8)),
       delayMs: Math.max(0, Math.min(10000, parseInt(v('cxllm-delayMs'), 10) || 900)),
       loopList: c('cxllm-loopList'),
       autoSave: c('cxllm-autoSave'),
       autoSubmit: c('cxllm-autoSubmit')
-    });
+    };
+    setCfg(cfg);
+    return { ...getCfg(), ...cfg };
   }
 
   function dragPanel(panel) {
@@ -1520,51 +1522,140 @@
     const cfg = getCfg();
     if (cfg.autoSubmit) {
       log('准备自动提交');
-      await sleep(1200);
-      submitWork();
-      await sleep(5000);
-      if (cfg.loopList) goBackListOrHistory();
+      await sleep(1000);
+      const submitted = await submitWork();
+      await sleep(2500);
+      if (submitted && cfg.loopList) {
+        log('提交链路已执行，返回列表继续扫描');
+        goBackListOrHistory();
+      } else {
+        log('提交链路未确认完成，已停留当前页，避免触发离页提示。', submitted ? 'warn' : 'error');
+        setRunning(false);
+      }
       return;
     }
     if (cfg.autoSave) {
       log('准备自动保存/暂存');
       await sleep(1000);
-      saveWork();
-      await sleep(3000);
-      if (cfg.loopList) goBackListOrHistory();
+      const saved = await saveWork();
+      await sleep(2500);
+      if (saved && cfg.loopList) goBackListOrHistory();
+      else setRunning(false);
       return;
     }
     log('未开启自动保存/提交，已停留在当前页');
     setRunning(false);
   }
 
-  function submitWork() {
+  function disableLeavePrompt() {
+    const clearOne = win => {
+      try { win.onbeforeunload = null; } catch (_) {}
+      try { win.onunload = null; } catch (_) {}
+      try { win.document?.body?.removeAttribute?.('onbeforeunload'); } catch (_) {}
+      try { win.document?.body?.removeAttribute?.('onunload'); } catch (_) {}
+    };
+    clearOne(W);
+    try { clearOne(W.top); } catch (_) {}
+  }
+
+  function looksLikeSubmitDone() {
+    const txt = cleanText(D.body?.innerText || '');
+    return /(提交成功|已提交|提交完成|作业已提交|待批阅|查看结果|已完成)/.test(txt)
+      || /selectWorkQuestionYiPiYue|workResult|workAnswer/i.test(location.href);
+  }
+
+  async function clickSubmitConfirm(timeoutMs = 8000) {
+    const started = Date.now();
+    const selectors = [
+      '.cx_alert-blue',
+      '.layui-layer-btn0',
+      '.layui-layer-btn a',
+      '.el-message-box__btns button',
+      '.el-button--primary',
+      '.ant-modal-confirm-btns button',
+      '.modal-footer button',
+      '.dialog button,.dialog a,.pop button,.pop a,.cx_alert button,.cx_alert a'
+    ];
+    while (Date.now() - started < timeoutMs) {
+      disableLeavePrompt();
+      if (looksLikeSubmitDone()) return true;
+      const bySelector = selectors.flatMap(sel => Array.from(D.querySelectorAll(sel)));
+      const byText = Array.from(D.querySelectorAll('button,a,span,div,input[type="button"],input[type="submit"]'));
+      const candidates = uniqBy([...bySelector, ...byText], cssPath)
+        .filter(visible)
+        .filter(el => !el.closest?.(`#${PANEL_ID}`))
+        .map(el => ({
+          el,
+          text: cleanText(el.value || el.innerText || el.textContent || ''),
+          cls: String(el.className || ''),
+          ctx: String(el.closest?.('[class]')?.className || '') + ' ' + String(el.parentElement?.className || '')
+        }))
+        .filter(x => {
+          const modalish = /cx_alert|layui|modal|dialog|pop|message|layer|confirm|btn/i.test(`${x.cls} ${x.ctx}`);
+          if (/cx_alert-blue|layui-layer-btn0|el-button--primary/.test(x.cls)) return true;
+          if (x.text === '提交' && !modalish) return false; // 排除页面右上角常驻提交按钮，避免误判二次确认
+          return /^(确定|确认|确认提交|提交|继续提交|我知道了|知道了)$/.test(x.text)
+            || /确认提交|确定提交|继续提交/.test(x.text);
+        });
+      if (candidates.length) {
+        const picked = candidates.sort((a, b) => {
+          const score = x => (/^(确定|确认|确认提交|继续提交)$/.test(x.text) ? 0 : 20) + Math.min(x.text.length, 30);
+          return score(a) - score(b);
+        })[0];
+        humanClick(picked.el);
+        dispatchClick(picked.el);
+        log(`已点击提交确认：${picked.text || picked.cls}`, 'ok');
+        await sleep(1200);
+        if (looksLikeSubmitDone()) return true;
+        return true;
+      }
+      await sleep(300);
+    }
+    return looksLikeSubmitDone();
+  }
+
+  async function submitWork() {
+    disableLeavePrompt();
     try { W.confirm = () => true; } catch (_) {}
-    try { if (typeof W.submitCheckTimes === 'function') W.submitCheckTimes(); } catch (_) {}
-    try { if (typeof W.escapeBlank === 'function') W.escapeBlank(); } catch (_) {}
+    try { W.top.confirm = () => true; } catch (_) {}
+    try { W.alert = msg => log(`页面 alert：${String(msg || '').slice(0, 120)}`, 'warn'); } catch (_) {}
+    try { if (typeof W.submitCheckTimes === 'function') W.submitCheckTimes(); } catch (e) { log(`submitCheckTimes 异常：${e.message || e}`, 'warn'); }
+    try { if (typeof W.escapeBlank === 'function') W.escapeBlank(); } catch (e) { log(`escapeBlank 异常：${e.message || e}`, 'warn'); }
+    let triggered = false;
     try {
       if (typeof W.submitAction === 'function') {
         W.submitAction();
+        triggered = true;
         log('已调用 submitAction()', 'ok');
-        return;
       }
     } catch (e) {
       log(`submitAction 调用异常：${e.message || e}`, 'warn');
     }
-    clickByText(['提交', '确认提交', '交卷']);
+    if (!triggered) triggered = clickByText(['提交', '确认提交', '交卷']);
+    const confirmed = await clickSubmitConfirm(triggered ? 9000 : 4000);
+    disableLeavePrompt();
+    if (confirmed) log('提交确认链路已执行', 'ok');
+    else log('未检测到提交确认按钮/成功状态', 'warn');
+    return confirmed;
   }
 
-  function saveWork() {
+  async function saveWork() {
+    disableLeavePrompt();
     try {
       if (typeof W.noSubmit === 'function') {
         W.noSubmit();
         log('已调用 noSubmit()', 'ok');
-        return;
+        await sleep(800);
+        disableLeavePrompt();
+        return true;
       }
     } catch (e) {
       log(`noSubmit 调用异常：${e.message || e}`, 'warn');
     }
-    clickByText(['暂时保存', '保存', '保存答案']);
+    const clicked = clickByText(['暂时保存', '保存', '保存答案']);
+    await sleep(800);
+    disableLeavePrompt();
+    return clicked;
   }
 
   function clickByText(words) {
