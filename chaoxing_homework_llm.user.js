@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.4
+// @version      1.0.5
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -16,7 +16,6 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @connect      *
-// @noframes
 // ==/UserScript==
 
 (() => {
@@ -24,14 +23,11 @@
 
   const W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const D = document;
+  const IS_TOP = (() => {
+    try { return W.top === W.self; } catch (_) { return true; }
+  })();
+  const BRIDGE = 'cxllm-homework-bridge-v1';
 
-  // Tampermonkey/ScriptCat may inject scripts into Chaoxing iframes by default.
-  // Running in frames creates duplicate floating panels and competing controllers.
-  try {
-    if (W.top !== W.self) return;
-  } catch (_) {
-    return;
-  }
   const STORE = 'cxllm_hw_';
   const PANEL_ID = 'cxllm-panel';
   const DEFAULT_CFG = {
@@ -991,6 +987,7 @@
     let n = el;
     for (let depth = 0; n && depth < 16; depth++, n = n.parentElement) {
       if (n.closest?.(`#${PANEL_ID}`)) break;
+      if (n.querySelector?.(`#${PANEL_ID}`)) continue;
       const txt = cleanText(n.innerText || n.textContent || '');
       if (!rowLikeText(txt)) continue;
       const r = n.getBoundingClientRect();
@@ -1015,6 +1012,7 @@
 
   function pushWorkCandidate(cands, row, preferredTarget = null) {
     if (!row || !visible(row)) return;
+    if (row.closest?.(`#${PANEL_ID}`) || row.querySelector?.(`#${PANEL_ID}`)) return;
     const txt = cleanText(row.innerText || row.textContent || '');
     if (!rowLikeText(txt)) return;
     const target = preferredTarget || findWorkTarget(row);
@@ -1066,21 +1064,56 @@
     return uniqBy(cands, c => c.url || cssPath(c.row)).sort((a, b) => a.text.length - b.text.length);
   }
 
-  function debugWorkList() {
+  async function debugWorkList() {
     const bodyText = cleanText(D.body?.innerText || '');
     const works = collectUnfinishedWorks();
-    log(`诊断：body含未交=${unfinishedText(bodyText)}，候选=${works.length}`, works.length ? 'ok' : 'warn');
+    log(`诊断(top)：body含未交=${unfinishedText(bodyText)}，候选=${works.length}`, works.length ? 'ok' : 'warn');
     works.slice(0, 8).forEach((w, i) => {
-      log(`候选#${i + 1}: ${w.text.replace(/\n/g, ' ').slice(0, 160)} | url=${w.url || 'none'}`);
+      log(`top候选#${i + 1}: ${w.text.replace(/\n/g, ' ').slice(0, 160)} | url=${w.url || 'none'}`);
     });
-    if (!works.length) {
+    const frameResults = IS_TOP ? await requestFrames('debug-list', {}, 2500) : [];
+    frameResults.forEach((res, idx) => {
+      log(`诊断(frame#${idx + 1})：href=${res.href || 'unknown'}，body含未交=${res.bodyHasUnfinished}，候选=${res.works?.length || 0}`, res.works?.length ? 'ok' : 'warn');
+      (res.works || []).slice(0, 8).forEach((w, i) => {
+        log(`frame#${idx + 1}候选#${i + 1}: ${String(w.text || '').replace(/\n/g, ' ').slice(0, 160)} | url=${w.url || 'none'}`);
+      });
+    });
+    if (!works.length && !frameResults.some(r => r.works?.length)) {
       const samples = Array.from(D.querySelectorAll('body *'))
         .filter(el => !el.closest(`#${PANEL_ID}`))
         .map(el => cleanText(el.innerText || el.textContent || ''))
         .filter(txt => txt && txt.length < 220 && (/未交|期末|作业|章节|模拟|多选|判断/.test(txt)))
         .slice(0, 12);
-      samples.forEach((txt, i) => log(`样本文本#${i + 1}: ${txt.replace(/\n/g, ' ').slice(0, 180)}`, 'warn'));
+      samples.forEach((txt, i) => log(`top样本文本#${i + 1}: ${txt.replace(/\n/g, ' ').slice(0, 180)}`, 'warn'));
     }
+  }
+
+  function summarizeWorksForBridge() {
+    return collectUnfinishedWorks().slice(0, 12).map(w => ({
+      text: w.text,
+      url: w.url || ''
+    }));
+  }
+
+  function setupFrameBridge() {
+    W.addEventListener('message', async ev => {
+      const msg = ev.data;
+      if (!msg || msg.bridge !== BRIDGE || msg.kind !== 'command') return;
+      const reply = data => {
+        try {
+          ev.source?.postMessage({ bridge: BRIDGE, id: msg.id, kind: 'result', ...data }, '*');
+        } catch (_) {}
+      };
+      if (msg.type === 'debug-list') {
+        const bodyText = cleanText(D.body?.innerText || '');
+        reply({ href: location.href, bodyHasUnfinished: unfinishedText(bodyText), works: summarizeWorksForBridge() });
+      } else if (msg.type === 'click-unfinished') {
+        reply({ href: location.href, clicked: clickUnfinishedFilter() });
+      } else if (msg.type === 'enter-next') {
+        const clicked = await enterNextWork({ stopOnMiss: false, frameFallback: false, clickFilter: true });
+        reply({ href: location.href, clicked, works: summarizeWorksForBridge() });
+      }
+    });
   }
 
   async function waitForUnfinishedWorks(timeoutMs = 10000) {
@@ -1107,6 +1140,57 @@
     return true;
   }
 
+  function clickUnfinishedFilter() {
+    const controls = Array.from(D.querySelectorAll('label,span,div,a,button,input,[role="radio"],[role="button"]'))
+      .filter(el => !el.closest(`#${PANEL_ID}`))
+      .filter(visible)
+      .filter(el => {
+        const txt = cleanText(el.value || el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+        return txt === '未完成' || /(^|\s)未完成($|\s)/.test(txt);
+      });
+    for (const el of controls) {
+      const target = el.closest('label') || el;
+      humanClick(target);
+      const input = target.querySelector?.('input[type="radio"],input[type="checkbox"]')
+        || el.querySelector?.('input[type="radio"],input[type="checkbox"]')
+        || (el.previousElementSibling?.matches?.('input') ? el.previousElementSibling : null)
+        || (el.nextElementSibling?.matches?.('input') ? el.nextElementSibling : null);
+      if (input) humanClick(input);
+      log('已点击“未完成”筛选');
+      return true;
+    }
+    return false;
+  }
+
+  function frameWindows() {
+    if (!IS_TOP) return [];
+    return Array.from(D.querySelectorAll('iframe'))
+      .map(f => f.contentWindow)
+      .filter(Boolean);
+  }
+
+  function requestFrames(type, payload = {}, timeoutMs = 3500) {
+    const frames = frameWindows();
+    if (!frames.length) return Promise.resolve([]);
+    return new Promise(resolve => {
+      const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const results = [];
+      const onMessage = ev => {
+        const data = ev.data;
+        if (!data || data.bridge !== BRIDGE || data.id !== id || data.kind !== 'result') return;
+        results.push(data);
+      };
+      W.addEventListener('message', onMessage);
+      for (const frame of frames) {
+        try { frame.postMessage({ bridge: BRIDGE, id, kind: 'command', type, payload }, '*'); } catch (_) {}
+      }
+      setTimeout(() => {
+        W.removeEventListener('message', onMessage);
+        resolve(results);
+      }, timeoutMs);
+    });
+  }
+
   function activateWorkCandidate(work) {
     if (work.url) {
       location.href = work.url;
@@ -1131,12 +1215,27 @@
     return true;
   }
 
-  async function enterNextWork() {
+  async function enterNextWork(options = {}) {
+    const { stopOnMiss = true, frameFallback = IS_TOP, clickFilter = true } = options;
+    if (clickFilter) {
+      const clickedFilter = clickUnfinishedFilter();
+      if (clickedFilter) await sleep(900);
+      if (IS_TOP) await requestFrames('click-unfinished', {}, 1200);
+    }
     if (clickStartButtonIfPresent()) return true;
     const works = await waitForUnfinishedWorks();
+    if (!works.length && frameFallback) {
+      const frameResults = await requestFrames('enter-next', {}, 5000);
+      const hit = frameResults.find(r => r.clicked);
+      if (hit) {
+        log(`iframe已进入作业：${(hit.works?.[0]?.text || hit.href || '').replace(/\n/g, ' ').slice(0, 120)}`, 'ok');
+        markPendingContinue();
+        return true;
+      }
+    }
     if (!works.length) {
       log('未找到未交作业，连续模式结束', 'warn');
-      setRunning(false);
+      if (stopOnMiss) setRunning(false);
       return false;
     }
     gmSet('listUrl', location.href);
@@ -1162,7 +1261,29 @@
     await enterNextWork();
   }
 
+  function exposeApi() {
+    W.__chaoxingHomeworkLLM = {
+      extractQuestions,
+      answerCurrentPage,
+      enterNextWork,
+      debugWorkList,
+      getCfg,
+      setCfg,
+      start: async () => { setRunning(true); await runController(); },
+      stop: () => setRunning(false)
+    };
+  }
+
   function autoBoot() {
+    setupFrameBridge();
+    exposeApi();
+    if (!IS_TOP) {
+      if (shouldAutoContinue()) {
+        setTimeout(runController, 1200);
+      }
+      return;
+    }
+
     mountPanel();
     try {
       if (typeof GM_registerMenuCommand === 'function') {
@@ -1173,15 +1294,6 @@
         GM_registerMenuCommand('学习通作业 LLM：停止', () => setRunning(false));
       }
     } catch (_) {}
-    W.__chaoxingHomeworkLLM = {
-      extractQuestions,
-      answerCurrentPage,
-      enterNextWork,
-      getCfg,
-      setCfg,
-      start: async () => { setRunning(true); await runController(); },
-      stop: () => setRunning(false)
-    };
     if (shouldAutoContinue()) {
       log('检测到刚刚的页面跳转，自动继续');
       setTimeout(runController, 1500);
