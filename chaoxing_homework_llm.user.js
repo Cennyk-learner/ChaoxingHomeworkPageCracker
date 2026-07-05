@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.2
+// @version      1.0.3
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -751,9 +751,20 @@
     return [];
   }
 
+  function optionByLabel(q, label) {
+    const normalized = String(label || '').trim().toUpperCase();
+    const exact = q.options.find(o => String(o.label || '').trim().toUpperCase() === normalized);
+    if (exact) return exact;
+    if (/^[A-H]$/.test(normalized)) {
+      const idx = normalized.charCodeAt(0) - 65;
+      if (idx >= 0 && idx < q.options.length) return q.options[idx];
+    }
+    return null;
+  }
+
   function findOptionByAnswer(q, answer) {
     const labels = parseLabels(answer);
-    if (labels.length) return labels.map(l => q.options.find(o => o.label === l)).filter(Boolean);
+    if (labels.length) return labels.map(l => optionByLabel(q, l)).filter(Boolean);
 
     const a = norm(answer);
     if (q.typeText === '判断题') {
@@ -781,10 +792,10 @@
     if (q.options.length) {
       const targets = findOptionByAnswer(q, answer);
       if (!targets.length) return false;
-      const wanted = new Set(targets.map(o => o.label));
+      const wanted = new Set(targets);
       if (q.typeText === '多选题') {
         for (const opt of q.options) {
-          const should = wanted.has(opt.label);
+          const should = wanted.has(opt);
           const selected = opt.selected();
           if (should !== selected) clickOption(opt);
         }
@@ -851,7 +862,8 @@
           log(`#${q.index} ${q.typeText} => ${String(ans).slice(0, 80)}`, 'ok');
         } else {
           fail++;
-          log(`#${q.index} 未能匹配答案：${String(ans).slice(0, 100)}`, 'warn');
+          const optionInfo = q.options.map(o => `${o.label || '?'}:${o.text || o.val || ''}`).join(' | ');
+          log(`#${q.index} 未能匹配答案：${String(ans).slice(0, 100)}；页面选项：${optionInfo}`, 'warn');
         }
         await sleep(cfg.delayMs);
       }
@@ -969,30 +981,88 @@
       && !/(已交|已提交|已完成|已批阅|提交成功)/.test(txt);
   }
 
+  function findWorkTarget(row) {
+    if (!row) return null;
+    const clickable = Array.from(row.querySelectorAll('a[href],[onclick],button,[role="button"],.blue,.jobCount,.work,.work-name'))
+      .filter(visible)
+      .find(el => !el.closest(`#${PANEL_ID}`));
+    return clickable || row;
+  }
+
+  function pushWorkCandidate(cands, row, preferredTarget = null) {
+    if (!row || !visible(row)) return;
+    const txt = cleanText(row.innerText);
+    if (!unfinishedText(txt)) return;
+    if (!/(作业|测试|练习|模拟|判断|单选|多选|期末|章节)/.test(txt)) return;
+    if (/智能分析|大雅相似度/.test(txt)) return;
+    const target = preferredTarget || findWorkTarget(row);
+    if (!target) return;
+    cands.push({ el: target, row, text: txt, url: workUrlFrom(target) || workUrlFrom(row) });
+  }
+
   function collectUnfinishedWorks() {
     const cands = [];
     const clickables = Array.from(D.querySelectorAll(
-      'a[href*="work"],a[href*="workId"],a[href*="dowork"],[onclick*="work"],[onclick*="workId"],[onclick*="dowork"]'
+      'a[href*="work"],a[href*="workId"],a[href*="dowork"],[onclick*="work"],[onclick*="Work"],[onclick*="workId"],[onclick*="dowork"]'
     )).filter(visible);
     for (const el of clickables) {
-      const row = closestRow(el);
-      const txt = cleanText(row.innerText);
-      if (unfinishedText(txt) && /(作业|测试|练习|模拟|判断|单选|多选|期末|章节)/.test(txt)) {
-        cands.push({ el, row, text: txt, url: workUrlFrom(el) || workUrlFrom(row) });
-      }
+      pushWorkCandidate(cands, closestRow(el), el);
     }
 
-    const leaves = Array.from(D.querySelectorAll('span,div,p,li,td'))
+    const statusLeaves = Array.from(D.querySelectorAll('body span,body div,body p,body li,body td'))
       .filter(visible)
-      .filter(el => unfinishedText(cleanText(el.innerText)) && cleanText(el.innerText).length < 80);
-    for (const leaf of leaves) {
-      const row = closestRow(leaf);
-      const txt = cleanText(row.innerText);
-      if (!unfinishedText(txt) || !/(作业|测试|练习|模拟|判断|单选|多选|期末|章节)/.test(txt)) continue;
-      const target = Array.from(row.querySelectorAll('a,[onclick]')).find(visible) || row;
-      cands.push({ el: target, row, text: txt, url: workUrlFrom(target) || workUrlFrom(row) });
+      .filter(el => {
+        const txt = cleanText(el.innerText);
+        return txt.length > 0 && txt.length < 120 && unfinishedText(txt);
+      });
+    for (const leaf of statusLeaves) {
+      pushWorkCandidate(cands, closestRow(leaf));
     }
+
+    const rowLike = Array.from(D.querySelectorAll('li,tr,[class*="work"],[class*="Work"],[class*="task"],[class*="Task"],[class*="item"],[class*="Item"]'))
+      .filter(visible)
+      .filter(el => {
+        const txt = cleanText(el.innerText);
+        return txt.length >= 4 && txt.length < 1200 && unfinishedText(txt);
+      });
+    for (const row of rowLike) {
+      pushWorkCandidate(cands, row);
+    }
+
     return uniqBy(cands, c => c.url || cssPath(c.row)).filter(c => !/智能分析|大雅相似度/.test(c.text));
+  }
+
+  async function waitForUnfinishedWorks(timeoutMs = 10000) {
+    const started = Date.now();
+    let logged = false;
+    while (Date.now() - started <= timeoutMs) {
+      const works = collectUnfinishedWorks();
+      if (works.length) return works;
+      if (!logged) {
+        log('等待作业列表加载/渲染...', 'warn');
+        logged = true;
+      }
+      await sleep(700);
+    }
+    return [];
+  }
+
+  function humanClick(el) {
+    if (!el || !visible(el)) return false;
+    try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
+    for (const type of ['mouseover', 'mousedown', 'mouseup', 'click']) {
+      el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: W }));
+    }
+    return true;
+  }
+
+  function activateWorkCandidate(work) {
+    if (work.url) {
+      location.href = work.url;
+      return;
+    }
+    const targets = uniqBy([work.el, work.row].filter(Boolean), cssPath);
+    for (const target of targets) humanClick(target);
   }
 
   function clickStartButtonIfPresent() {
@@ -1012,7 +1082,7 @@
 
   async function enterNextWork() {
     if (clickStartButtonIfPresent()) return true;
-    const works = collectUnfinishedWorks();
+    const works = await waitForUnfinishedWorks();
     if (!works.length) {
       log('未找到未交作业，连续模式结束', 'warn');
       setRunning(false);
@@ -1022,13 +1092,9 @@
     const w = works[0];
     log(`进入作业：${w.text.replace(/\n/g, ' ').slice(0, 120)}`);
     markPendingContinue();
-    if (w.url) {
-      location.href = w.url;
-    } else {
-      const a = w.el.matches?.('a') ? w.el : w.el.querySelector?.('a');
-      if (a) a.removeAttribute('target');
-      w.el.click();
-    }
+    const a = w.el.matches?.('a') ? w.el : w.el.querySelector?.('a');
+    if (a) a.removeAttribute('target');
+    activateWorkCandidate(w);
     return true;
   }
 
