@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.0
+// @version      1.0.1
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -16,6 +16,7 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @connect      *
+// @noframes
 // ==/UserScript==
 
 (() => {
@@ -23,6 +24,14 @@
 
   const W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const D = document;
+
+  // Tampermonkey/ScriptCat may inject scripts into Chaoxing iframes by default.
+  // Running in frames creates duplicate floating panels and competing controllers.
+  try {
+    if (W.top !== W.self) return;
+  } catch (_) {
+    return;
+  }
   const STORE = 'cxllm_hw_';
   const PANEL_ID = 'cxllm-panel';
   const DEFAULT_CFG = {
@@ -83,12 +92,63 @@
     gmSet('cfg', { ...getCfg(), ...cfg });
   }
 
+  const RUN_TTL_MS = 10 * 60 * 1000;
+
+  function getRunState() {
+    const state = gmGet('runState', null);
+    if (!state || typeof state !== 'object') {
+      return { active: false, token: '', startedAt: 0, updatedAt: 0 };
+    }
+    return {
+      active: !!state.active,
+      pendingContinue: !!state.pendingContinue,
+      token: String(state.token || ''),
+      startedAt: Number(state.startedAt || 0),
+      updatedAt: Number(state.updatedAt || 0)
+    };
+  }
+
+  function isFreshRunState(state = getRunState()) {
+    return !!state.active && Date.now() - state.updatedAt <= RUN_TTL_MS;
+  }
+
   function isRunning() {
-    return !!gmGet('running', false);
+    return isFreshRunState();
+  }
+
+  function shouldAutoContinue() {
+    const state = getRunState();
+    return !!state.pendingContinue && isFreshRunState(state);
+  }
+
+  function touchRunning(pendingContinue = false) {
+    const state = getRunState();
+    if (!state.active) return;
+    state.pendingContinue = !!pendingContinue;
+    state.updatedAt = Date.now();
+    gmSet('runState', state);
+    gmSet('running', false); // clear legacy boolean state from v1.0.0
+  }
+
+  function markPendingContinue() {
+    touchRunning(true);
   }
 
   function setRunning(v) {
-    gmSet('running', !!v);
+    const now = Date.now();
+    if (v) {
+      gmSet('runState', {
+        active: true,
+        pendingContinue: false,
+        token: `${now}-${Math.random().toString(36).slice(2)}`,
+        startedAt: now,
+        updatedAt: now
+      });
+    } else {
+      const state = getRunState();
+      gmSet('runState', { ...state, active: false, pendingContinue: false, updatedAt: now });
+    }
+    gmSet('running', false); // clear legacy boolean state from v1.0.0
   }
 
   function nowTime() {
@@ -725,6 +785,7 @@
         log('运行已停止，退出答题', 'warn');
         break;
       }
+      touchRunning(false);
       const batch = batches[bi];
       log(`调用模型：第 ${bi + 1}/${batches.length} 批（${batch.length} 题）`);
       let answers;
@@ -831,6 +892,7 @@
 
   function goBackListOrHistory() {
     const listUrl = gmGet('listUrl', '');
+    markPendingContinue();
     if (listUrl) {
       log('返回作业列表继续扫描');
       location.href = listUrl;
@@ -904,6 +966,7 @@
       });
     if (!els.length) return false;
     log(`点击进入按钮：${cleanText(els[0].value || els[0].innerText)}`);
+    markPendingContinue();
     els[0].click();
     return true;
   }
@@ -919,6 +982,7 @@
     gmSet('listUrl', location.href);
     const w = works[0];
     log(`进入作业：${w.text.replace(/\n/g, ' ').slice(0, 120)}`);
+    markPendingContinue();
     if (w.url) {
       location.href = w.url;
     } else {
@@ -930,6 +994,7 @@
   }
 
   async function runController() {
+    touchRunning(false);
     try { W.confirm = () => true; } catch (_) {}
     await sleep(800);
     const qs = extractQuestions();
@@ -961,9 +1026,12 @@
       start: async () => { setRunning(true); await runController(); },
       stop: () => setRunning(false)
     };
-    if (isRunning()) {
-      log('检测到运行状态，自动继续');
+    if (shouldAutoContinue()) {
+      log('检测到刚刚的页面跳转，自动继续');
       setTimeout(runController, 1500);
+    } else if (getRunState().active && !isRunning()) {
+      setRunning(false);
+      log('已清理过期运行状态', 'warn');
     }
   }
 
