@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.8
+// @version      1.0.9
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -61,31 +61,44 @@
 
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+  function readLocalValue(key, def) {
+    const raw = localStorage.getItem(STORE + key);
+    if (raw == null) return def;
+    try { return JSON.parse(raw); } catch { return raw; }
+  }
+
   function gmGet(key, def) {
     try {
       const v = GM_getValue(STORE + key);
-      return v === undefined ? def : v;
-    } catch (_) {
-      const raw = localStorage.getItem(STORE + key);
-      if (raw == null) return def;
-      try { return JSON.parse(raw); } catch { return raw; }
-    }
+      if (v !== undefined) return v;
+    } catch (_) { /* fall through */ }
+    return readLocalValue(key, def);
   }
 
   function gmSet(key, val) {
-    try {
-      GM_setValue(STORE + key, val);
-    } catch (_) {
-      localStorage.setItem(STORE + key, JSON.stringify(val));
+    try { GM_setValue(STORE + key, val); } catch (_) { /* keep local mirror */ }
+    try { localStorage.setItem(STORE + key, JSON.stringify(val)); } catch (_) {}
+  }
+
+  function parseStoredCfg(raw) {
+    if (!raw) return {};
+    if (typeof raw === 'string') {
+      try { return JSON.parse(raw) || {}; } catch { return {}; }
     }
+    return typeof raw === 'object' ? raw : {};
   }
 
   function getCfg() {
-    return { ...DEFAULT_CFG, ...(gmGet('cfg', {}) || {}) };
+    // cfg_json 是跨页面兜底：部分脚本管理器/跨子域场景下对象型 GM_setValue 会不稳定。
+    const byJson = parseStoredCfg(gmGet('cfg_json', ''));
+    const byObj = parseStoredCfg(gmGet('cfg', {}));
+    return { ...DEFAULT_CFG, ...byObj, ...byJson };
   }
 
   function setCfg(cfg) {
-    gmSet('cfg', { ...getCfg(), ...cfg });
+    const merged = { ...getCfg(), ...cfg };
+    gmSet('cfg', merged);
+    gmSet('cfg_json', JSON.stringify(merged));
   }
 
   const RUN_TTL_MS = 10 * 60 * 1000;
@@ -907,7 +920,12 @@
       if (!id) id = String(i + 1);
       questions.push({ id: String(id), index: i + 1, root, typeText, question, options, inputs: textInputs(root) });
     });
-    return uniqBy(questions, q => `${q.id}:${norm(q.question).slice(0, 80)}`);
+    const unique = uniqBy(questions, q => `${q.id}:${norm(q.question).slice(0, 80)}`);
+    unique.forEach((q, idx) => {
+      q.index = idx + 1;
+      q.nextRoot = unique[idx + 1]?.root || null;
+    });
+    return unique;
   }
 
   function isSelected(el) {
@@ -950,6 +968,7 @@
       }
     };
     add(findChaoxingOptionLi(q, label, text));
+    add(findVisualOptionByPosition(q, label, text));
     add(opt.el);
     if (root?.querySelectorAll) {
       const nodes = Array.from(root.querySelectorAll('input,li,label,a,button,span,div,em,[id-param],[val-param]'))
@@ -978,6 +997,154 @@
         };
         return score(a) - score(b);
       });
+  }
+
+  function optionVerticalBounds(q) {
+    const rootRect = q?.root?.getBoundingClientRect?.();
+    const nextRect = q?.nextRoot?.getBoundingClientRect?.();
+    const top = rootRect ? rootRect.top - 8 : -Infinity;
+    let bottom = nextRect ? nextRect.top - 6 : (rootRect ? rootRect.bottom + 260 : Infinity);
+    if (rootRect && (!Number.isFinite(bottom) || bottom <= top + 60)) bottom = rootRect.bottom + 260;
+    return { top, bottom };
+  }
+
+  function optionContainerAround(el, label, text) {
+    let best = el;
+    const wantText = norm(text || '');
+    for (let n = el, depth = 0; n && depth < 7; depth++, n = n.parentElement) {
+      if (!visible(n) || n.closest?.(`#${PANEL_ID}`)) continue;
+      const r = n.getBoundingClientRect();
+      const t = cleanText(n.innerText || n.textContent || '');
+      if (r.height > 0 && r.height <= 90 && r.width > 0 && r.width <= 900 && t.length <= 140) {
+        best = n;
+        const nt = norm(t);
+        if ((!wantText || nt.includes(wantText)) && (t.includes(label) || optionLabelFromElement(n) === label)) break;
+      }
+    }
+    return best;
+  }
+
+  function findVisualOptionByPosition(q, label, text = '') {
+    if (!q?.root) return null;
+    const l = String(label || '').toUpperCase();
+    const wantText = cleanText(text || optionTextForLabel(q.typeText, l));
+    const wantNorm = norm(wantText);
+    const { top, bottom } = optionVerticalBounds(q);
+    const rootRect = q.root.getBoundingClientRect?.();
+    const nodes = Array.from(D.querySelectorAll('li,label,button,a,span,div,em,i,b'))
+      .filter(el => !el.closest(`#${PANEL_ID}`))
+      .filter(visible)
+      .map(el => ({ el, rect: el.getBoundingClientRect(), txt: cleanText(el.innerText || el.textContent || el.value || '') }))
+      .filter(x => x.rect.top >= top && x.rect.top < bottom && x.rect.height > 0 && x.rect.height <= 100 && x.rect.width > 0 && x.txt.length > 0 && x.txt.length <= 160);
+    const scored = [];
+    for (const item of nodes) {
+      const elLabel = optionLabelFromElement(item.el);
+      const nt = norm(item.txt);
+      let matched = false;
+      let score = 1000;
+      if (item.txt.trim().toUpperCase() === l || elLabel === l) { matched = true; score -= 520; }
+      if (wantNorm && nt === wantNorm) { matched = true; score -= 420; }
+      if (wantNorm && nt && (nt.includes(wantNorm) || wantNorm.includes(nt))) { matched = true; score -= 160; }
+      if (!matched) continue;
+      const target = optionContainerAround(item.el, l, wantText);
+      const tr = target.getBoundingClientRect();
+      const tt = cleanText(target.innerText || target.textContent || '');
+      const ttn = norm(tt);
+      if (tt.includes(l) || optionLabelFromElement(target) === l) score -= 120;
+      if (wantNorm && ttn.includes(wantNorm)) score -= 90;
+      if (rootRect) {
+        score += Math.abs(tr.top - rootRect.bottom) / 3;
+        if (tr.left < rootRect.left - 80) score += 80;
+        if (tr.left > rootRect.left + 1200) score += 80;
+      }
+      score += Math.min(tt.length, 80);
+      scored.push({ target, score });
+    }
+    scored.sort((a, b) => a.score - b.score);
+    return scored[0]?.target || null;
+  }
+
+  function optionAnswerValue(q, opt) {
+    const label = String(opt?.label || '').toUpperCase();
+    const val = String(opt?.el?.getAttribute?.('val-param') || opt?.val || '').toLowerCase();
+    if (/^(true|false|0|1)$/.test(val)) return val;
+    if (q?.typeText === '判断题') {
+      if (label === 'A') return 'true';
+      if (label === 'B') return 'false';
+    }
+    return label || cleanText(opt?.text || '');
+  }
+
+  function dispatchInputChange(el) {
+    try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
+    try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (_) {}
+    try { el.dispatchEvent(new Event('blur', { bubbles: true })); } catch (_) {}
+  }
+
+  function markVisualPicked(q, opt, target) {
+    if (!target) return false;
+    const picked = optionContainerAround(target, String(opt?.label || '').toUpperCase(), opt?.text || '') || target;
+    if (q?.typeText !== '多选题') {
+      const { top, bottom } = optionVerticalBounds(q);
+      Array.from(D.querySelectorAll('[data-cxllm-picked="1"],.cur,.selected,.active,.checked,.on'))
+        .filter(el => !el.closest(`#${PANEL_ID}`))
+        .filter(el => {
+          const r = el.getBoundingClientRect?.();
+          return r && r.top >= top && r.top < bottom;
+        })
+        .forEach(el => {
+          if (el === picked || picked.contains?.(el)) return;
+          el.classList.remove('cur', 'selected', 'active', 'checked', 'on');
+          el.removeAttribute('data-cxllm-picked');
+          if (el.getAttribute('aria-checked') === 'true') el.setAttribute('aria-checked', 'false');
+        });
+    }
+    picked.classList.add('cur', 'selected');
+    picked.setAttribute('data-cxllm-picked', '1');
+    picked.setAttribute('aria-checked', 'true');
+    return true;
+  }
+
+  function forceSetAnswer(q, opt) {
+    const label = String(opt?.label || '').toUpperCase();
+    if (!label) return false;
+    const realTarget = findChaoxingOptionLi(q, label, opt?.text) || findVisualOptionByPosition(q, label, opt?.text) || null;
+    const target = realTarget || (opt?.el && opt.el !== q?.root ? opt.el : null);
+    let changed = false;
+    const value = optionAnswerValue(q, { ...opt, el: target || opt?.el });
+
+    const inputScopes = uniqBy([target, target?.parentElement].filter(Boolean), cssPath);
+    for (const scope of inputScopes) {
+      const inputs = Array.from(scope.querySelectorAll?.('input[type="radio"],input[type="checkbox"]') || []);
+      for (const input of inputs) {
+        input.checked = true;
+        input.setAttribute('checked', 'checked');
+        dispatchInputChange(input);
+        changed = true;
+      }
+    }
+
+    const answerScopes = uniqBy([q?.root, q?.root?.parentElement, q?.root?.parentElement?.parentElement].filter(Boolean), cssPath);
+    const key = questionKey(q);
+    let answerInputs = uniqBy(answerScopes.flatMap(scope => Array.from(scope.querySelectorAll?.('input[name*="answer"],input[id*="answer"],textarea[name*="answer"]') || [])), cssPath)
+      .filter(el => !/^answertype/i.test(el.id || '') && !/type/i.test(el.name || ''));
+    if (key) {
+      answerInputs = answerInputs.filter(el => String(el.name || el.id || '').includes(key));
+    } else if (answerInputs.length > 1 && q?.root?.contains) {
+      answerInputs = answerInputs.filter(el => q.root.contains(el));
+    }
+    for (const input of answerInputs) {
+      if (q?.typeText === '多选题' && input.value && !String(input.value).includes(value)) {
+        input.value = `${input.value}${/[A-H]$/.test(String(input.value)) ? '' : ','}${value}`;
+      } else {
+        input.value = value;
+      }
+      dispatchInputChange(input);
+      changed = true;
+    }
+
+    if (target) changed = markVisualPicked(q, opt, target) || changed;
+    return changed;
   }
 
   function dispatchClick(el) {
@@ -1011,17 +1178,27 @@
       if (label === 'A') ['true', '1', '对', '正确'].forEach(v => values.add(v));
       if (label === 'B') ['false', '0', '错', '错误'].forEach(v => values.add(v));
     }
-    const inputs = Array.from(root.querySelectorAll('input[name*="answer"],input[id*="answer"],textarea'))
+    const scopes = uniqBy([root, root.parentElement, root.parentElement?.parentElement].filter(Boolean), cssPath);
+    const key = questionKey(q);
+    let inputs = uniqBy(scopes.flatMap(scope => Array.from(scope.querySelectorAll?.('input[name*="answer"],input[id*="answer"],textarea,input[type="radio"],input[type="checkbox"]') || [])), cssPath)
       .filter(el => !/^answertype/i.test(el.id || ''));
+    if (key) {
+      inputs = inputs.filter(el => {
+        const name = String(el.name || el.id || '');
+        return !name || name.includes(key) || el.closest?.('[data-cxllm-picked="1"],.cur,.selected');
+      });
+    }
     return inputs.some(input => {
-      if (input.matches?.('input[type="radio"],input[type="checkbox"]')) return input.checked && values.has(String(input.value || '').toLowerCase());
+      if (input.matches?.('input[type="radio"],input[type="checkbox"]')) {
+        return input.checked && (values.has(String(input.value || '').toLowerCase()) || values.has(norm(input.value || '')));
+      }
       const v = cleanText(input.value || '');
       return v && (values.has(v.toUpperCase()) || values.has(v.toLowerCase()) || values.has(norm(v)));
     });
   }
 
   function optionConfirmed(q, opt, target) {
-    const concrete = findChaoxingOptionLi(q, opt?.label, opt?.text) || opt?.el;
+    const concrete = findChaoxingOptionLi(q, opt?.label, opt?.text) || findVisualOptionByPosition(q, opt?.label, opt?.text) || opt?.el;
     return isSelected(concrete) || isSelected(opt?.el) || isSelected(target) || optionValueConfirmed(q, { ...opt, el: concrete });
   }
 
@@ -1040,6 +1217,12 @@
       }
       const after = answerStateSignature(root);
       if (after && after !== before && optionConfirmed(q, opt, target)) return true;
+    }
+    // 兜底：部分新版学习通页面把选项做成自定义组件，普通 click 不改变 DOM。
+    // 这里按原脚本思路直接写入 radio/hidden answer，并给选项容器打选中态，避免“匹配到了但没填上”。
+    if (forceSetAnswer(q, opt)) {
+      await sleep(80);
+      if (optionConfirmed(q, opt, opt.el)) return true;
     }
     return false;
   }
@@ -1331,12 +1514,31 @@
     return candidates[0]?.el || el;
   }
 
+  function isBadWorkClickText(txt) {
+    return !txt || /^(作业|考试|未交|未提交|未完成|已完成|已交|已提交|剩余|筛选)$/.test(txt) || txt.length < 2;
+  }
+
   function findWorkTarget(row) {
     if (!row) return null;
-    const clickable = Array.from(row.querySelectorAll('a[href],[onclick],button,[role="button"],.blue,.jobCount,.work,.work-name'))
-      .filter(visible)
-      .find(el => !el.closest(`#${PANEL_ID}`));
-    return clickable || row;
+    const all = Array.from(row.querySelectorAll('a[href],[onclick],button,[role="button"],[tabindex],.jobCount,.work,.work-name,.title,.name,span,div'))
+      .filter(el => !el.closest(`#${PANEL_ID}`))
+      .filter(visible);
+    const scored = all.map(el => {
+      const txt = cleanText(el.value || el.innerText || el.textContent || '');
+      const cls = String(el.className || '');
+      const tag = el.tagName.toLowerCase();
+      let score = 100;
+      if (isBadWorkClickText(txt)) score += 80;
+      if (/作业|测试|练习|模拟|判断|单选|多选|期末|章节|导论|第[一二三四五六七八九十\d]+章/.test(txt)) score -= 80;
+      if (el.matches('a[href],[onclick],button,[role="button"],[tabindex]')) score -= 45;
+      if (/work|job|title|name|item|task/i.test(cls)) score -= 25;
+      if (/blue|icon|tag|status|label/i.test(cls) || txt === '作业') score += 45;
+      if (tag === 'span' || tag === 'div') score += 5;
+      score += Math.min(txt.length / 4, 60);
+      return { el, score, txt };
+    }).filter(x => !isBadWorkClickText(x.txt) || x.score < 100);
+    scored.sort((a, b) => a.score - b.score);
+    return scored[0]?.el || row;
   }
 
   function pushWorkCandidate(cands, row, preferredTarget = null) {
@@ -1439,8 +1641,16 @@
       } else if (msg.type === 'click-unfinished') {
         reply({ href: location.href, clicked: clickUnfinishedFilter() });
       } else if (msg.type === 'enter-next') {
+        const beforeWorks = collectUnfinishedWorks();
+        const first = beforeWorks[0] || null;
         const clicked = await enterNextWork({ stopOnMiss: false, frameFallback: false, clickFilter: true });
-        reply({ href: location.href, clicked, works: summarizeWorksForBridge() });
+        reply({
+          href: location.href,
+          clicked,
+          targetUrl: first?.url || '',
+          targetText: first?.text || '',
+          works: summarizeWorksForBridge()
+        });
       }
     });
   }
@@ -1523,10 +1733,13 @@
   function activateWorkCandidate(work) {
     if (work.url) {
       location.href = work.url;
-      return;
+      return true;
     }
-    const targets = uniqBy([work.el, work.row].filter(Boolean), cssPath);
-    for (const target of targets) humanClick(target);
+    const titleTarget = findWorkTarget(work.row);
+    const targets = uniqBy([titleTarget, work.el, work.row].filter(Boolean), cssPath);
+    let clicked = false;
+    for (const target of targets) clicked = humanClick(target) || clicked;
+    return clicked;
   }
 
   function clickStartButtonIfPresent() {
@@ -1569,8 +1782,13 @@
       const frameResults = await requestFrames('enter-next', {}, 5000);
       const hit = frameResults.find(r => r.clicked);
       if (hit) {
-        log(`iframe已进入作业：${(hit.works?.[0]?.text || hit.href || '').replace(/\n/g, ' ').slice(0, 120)}`, 'ok');
+        const targetUrl = hit.targetUrl || hit.works?.[0]?.url || '';
+        log(`iframe已处理作业：${(hit.targetText || hit.works?.[0]?.text || hit.href || '').replace(/\n/g, ' ').slice(0, 120)}`, targetUrl ? 'ok' : 'warn');
         markPendingContinue();
+        if (targetUrl) {
+          log('使用 iframe 返回的作业 URL 在顶层跳转', 'ok');
+          location.href = targetUrl;
+        }
         return true;
       }
     }
@@ -1585,7 +1803,14 @@
     markPendingContinue();
     const a = w.el.matches?.('a') ? w.el : w.el.querySelector?.('a');
     if (a) a.removeAttribute('target');
-    activateWorkCandidate(w);
+    const beforeHref = location.href;
+    const activated = activateWorkCandidate(w);
+    if (!w.url && activated) {
+      await sleep(1200);
+      if (location.href === beforeHref && !extractQuestions().length) {
+        log('已点击作业行/标题，但当前框架还未跳转；如仍停留列表，请点“诊断列表”发候选信息。', 'warn');
+      }
+    }
     return true;
   }
 
