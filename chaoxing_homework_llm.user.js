@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.1
+// @version      1.0.2
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -232,8 +232,18 @@
         #${PANEL_ID} label{display:block;margin:6px 0 3px;color:#a5d8ff}
         #${PANEL_ID} input,#${PANEL_ID} select{box-sizing:border-box;width:100%;border:1px solid #49657d;
           border-radius:7px;background:#0b1420;color:#f8f9fa;padding:6px 8px;outline:none}
-        #${PANEL_ID} input[type=checkbox]{width:auto;vertical-align:middle;margin-right:6px}
+        #${PANEL_ID} input[type=checkbox][hidden]{display:none!important}
         #${PANEL_ID} .row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+        #${PANEL_ID} .cxllm-toggles{display:flex;flex-direction:column;gap:6px;margin:8px 0 2px}
+        #${PANEL_ID} .cxllm-toggle{display:flex;align-items:center;gap:7px;width:100%;padding:0!important;
+          border:0!important;background:transparent!important;color:#cfe8ff!important;text-align:left!important;
+          cursor:pointer!important;font:inherit!important;box-shadow:none!important;user-select:none}
+        #${PANEL_ID} .cxllm-toggle:hover{color:#ffffff!important}
+        #${PANEL_ID} .cxllm-switch{position:relative;display:inline-block;flex:0 0 auto;width:18px;height:18px;
+          border:1px solid #74c0fc;border-radius:50%;background:#0b1420;box-sizing:border-box}
+        #${PANEL_ID} .cxllm-toggle.on .cxllm-switch{background:#228be6;border-color:#74c0fc}
+        #${PANEL_ID} .cxllm-toggle.on .cxllm-switch::after{content:'✓';position:absolute;left:3px;top:-3px;
+          color:#fff;font-size:16px;font-weight:700}
         #${PANEL_ID} .btns{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
         #${PANEL_ID} button{border:0;border-radius:7px;padding:7px 10px;cursor:pointer;color:#fff;background:#228be6}
         #${PANEL_ID} button.gray{background:#495057}
@@ -266,9 +276,14 @@
           <div><label>每批题数</label><input id="cxllm-batchSize" type="number" min="1" max="30"></div>
           <div><label>填题间隔(ms)</label><input id="cxllm-delayMs" type="number" min="0" max="10000"></div>
         </div>
-        <label><input id="cxllm-loopList" type="checkbox">从作业列表连续进入未交作业</label>
-        <label><input id="cxllm-autoSave" type="checkbox">答完后自动暂存/保存</label>
-        <label><input id="cxllm-autoSubmit" type="checkbox">答完后自动提交</label>
+        <div class="cxllm-toggles">
+          <input id="cxllm-loopList" type="checkbox" hidden>
+          <button type="button" class="cxllm-toggle" data-input="cxllm-loopList" aria-pressed="false"><span class="cxllm-switch"></span><span>从作业列表连续进入未交作业</span></button>
+          <input id="cxllm-autoSave" type="checkbox" hidden>
+          <button type="button" class="cxllm-toggle" data-input="cxllm-autoSave" aria-pressed="false"><span class="cxllm-switch"></span><span>答完后自动暂存/保存</span></button>
+          <input id="cxllm-autoSubmit" type="checkbox" hidden>
+          <button type="button" class="cxllm-toggle" data-input="cxllm-autoSubmit" aria-pressed="false"><span class="cxllm-switch"></span><span>答完后自动提交</span></button>
+        </div>
         <div class="btns">
           <button class="green" id="cxllm-save">保存配置</button>
           <button id="cxllm-start">开始</button>
@@ -281,7 +296,18 @@
     D.documentElement.appendChild(panel);
 
     const setVal = (id, val) => { const el = D.getElementById(id); if (el) el.value = val ?? ''; };
-    const setChk = (id, val) => { const el = D.getElementById(id); if (el) el.checked = !!val; };
+    const syncToggle = id => {
+      const el = D.getElementById(id);
+      const btn = panel.querySelector(`.cxllm-toggle[data-input="${id}"]`);
+      if (!el || !btn) return;
+      btn.classList.toggle('on', !!el.checked);
+      btn.setAttribute('aria-pressed', String(!!el.checked));
+    };
+    const setChk = (id, val) => {
+      const el = D.getElementById(id);
+      if (el) el.checked = !!val;
+      syncToggle(id);
+    };
     D.getElementById('cxllm-provider').value = cfg.provider;
     setVal('cxllm-apiUrl', cfg.apiUrl);
     setVal('cxllm-apiKey', cfg.apiKey);
@@ -291,6 +317,19 @@
     setChk('cxllm-loopList', cfg.loopList);
     setChk('cxllm-autoSave', cfg.autoSave);
     setChk('cxllm-autoSubmit', cfg.autoSubmit);
+
+    panel.querySelectorAll('.cxllm-toggle').forEach(btn => {
+      btn.addEventListener('click', ev => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const id = btn.getAttribute('data-input');
+        const input = D.getElementById(id);
+        if (!input) return;
+        input.checked = !input.checked;
+        syncToggle(id);
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+    });
 
     D.getElementById('cxllm-save').onclick = () => {
       savePanelCfg();
