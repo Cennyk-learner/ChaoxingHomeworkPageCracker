@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.16
+// @version      1.0.19
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -1156,7 +1156,7 @@
   function markVisualPicked(q, opt, target) {
     if (!target) return false;
     const picked = optionContainerAround(target, String(opt?.label || '').toUpperCase(), opt?.text || '') || target;
-    if (q?.typeText !== '多选题') {
+    if (q?.typeText !== '多选题' && !q?.__cxllmForceMulti) {
       const { top, bottom } = optionVerticalBounds(q);
       Array.from(D.querySelectorAll('[data-cxllm-picked="1"],.cur,.selected,.active,.checked,.on'))
         .filter(el => !el.closest(`#${PANEL_ID}`))
@@ -1202,11 +1202,44 @@
     return true;
   }
 
+  function answerInputsForQuestion(q) {
+    const answerScopes = uniqBy([q?.root, q?.root?.parentElement, q?.root?.parentElement?.parentElement].filter(Boolean), cssPath);
+    const key = questionKey(q);
+    let answerInputs = uniqBy(answerScopes.flatMap(scope => Array.from(scope.querySelectorAll?.('input[name*="answer"],input[id*="answer"],textarea[name*="answer"]') || [])), cssPath)
+      .filter(el => !/^answertype/i.test(el.id || '') && !/type/i.test(el.name || ''));
+    if (key) {
+      answerInputs = answerInputs.filter(el => String(el.name || el.id || '').includes(key));
+    } else if (answerInputs.length > 1 && q?.root?.contains) {
+      answerInputs = answerInputs.filter(el => q.root.contains(el));
+    }
+    return answerInputs;
+  }
+
+  function setQuestionAnswerValue(q, value) {
+    let changed = false;
+    for (const input of answerInputsForQuestion(q)) {
+      setNativeValue(input, String(value || ''));
+      dispatchInputChange(input);
+      changed = true;
+    }
+    return changed;
+  }
+
+  function optionTargetFor(q, opt) {
+    const label = String(opt?.label || '').toUpperCase();
+    return findChaoxingOptionLi(q, label, opt?.text) || findVisualOptionByPosition(q, label, opt?.text) || (opt?.el && opt.el !== q?.root ? opt.el : null);
+  }
+
+  function fullMultiAnswerValue(targets) {
+    return [...new Set(targets.map(o => String(o?.label || '').toUpperCase()).filter(Boolean))]
+      .sort()
+      .join('');
+  }
+
   function forceSetAnswer(q, opt) {
     const label = String(opt?.label || '').toUpperCase();
     if (!label) return false;
-    const realTarget = findChaoxingOptionLi(q, label, opt?.text) || findVisualOptionByPosition(q, label, opt?.text) || null;
-    const target = realTarget || (opt?.el && opt.el !== q?.root ? opt.el : null);
+    const target = optionTargetFor(q, opt);
     let changed = false;
     const value = optionAnswerValue(q, { ...opt, el: target || opt?.el });
 
@@ -1221,18 +1254,11 @@
       }
     }
 
-    const answerScopes = uniqBy([q?.root, q?.root?.parentElement, q?.root?.parentElement?.parentElement].filter(Boolean), cssPath);
-    const key = questionKey(q);
-    let answerInputs = uniqBy(answerScopes.flatMap(scope => Array.from(scope.querySelectorAll?.('input[name*="answer"],input[id*="answer"],textarea[name*="answer"]') || [])), cssPath)
-      .filter(el => !/^answertype/i.test(el.id || '') && !/type/i.test(el.name || ''));
-    if (key) {
-      answerInputs = answerInputs.filter(el => String(el.name || el.id || '').includes(key));
-    } else if (answerInputs.length > 1 && q?.root?.contains) {
-      answerInputs = answerInputs.filter(el => q.root.contains(el));
-    }
-    for (const input of answerInputs) {
-      if (q?.typeText === '多选题' && input.value && !String(input.value).includes(value)) {
-        setNativeValue(input, `${input.value}${/[A-H]$/.test(String(input.value)) ? '' : ','}${value}`);
+    for (const input of answerInputsForQuestion(q)) {
+      if (q?.typeText === '多选题' || q?.__cxllmForceMulti) {
+        const oldVal = String(input.value || '').replace(/[^A-H]/gi, '').toUpperCase();
+        const merged = [...new Set(`${oldVal}${label}`.split('').filter(Boolean))].sort().join('');
+        setNativeValue(input, merged);
       } else {
         setNativeValue(input, value);
       }
@@ -1240,7 +1266,11 @@
       changed = true;
     }
 
-    if (changed && target) markVisualPicked(q, opt, target);
+    if (target) {
+      markVisualPicked(q, opt, target);
+      // 多选自定义控件常常没有真实 input；只要找到了目标，也要把该项视觉选中并参与后续确认。
+      if (q?.typeText === '多选题' || q?.__cxllmForceMulti) changed = true;
+    }
     return changed;
   }
 
@@ -1300,6 +1330,8 @@
         return input.checked && (values.has(String(input.value || '').toLowerCase()) || values.has(norm(input.value || '')));
       }
       const v = cleanText(input.value || '');
+      const vu = v.toUpperCase().replace(/[^A-H]/g, '');
+      if ((q?.typeText === '多选题' || q?.__cxllmForceMulti) && label && vu.includes(label)) return true;
       return v && (values.has(v.toUpperCase()) || values.has(v.toLowerCase()) || values.has(norm(v)));
     });
   }
@@ -1307,6 +1339,11 @@
   function optionConfirmed(q, opt, target) {
     const concrete = findChaoxingOptionLi(q, opt?.label, opt?.text) || findVisualOptionByPosition(q, opt?.label, opt?.text) || opt?.el;
     return optionValueConfirmed(q, { ...opt, el: concrete }) || isSelected(concrete) || isSelected(opt?.el) || isSelected(target);
+  }
+
+  function optionUiConfirmed(q, opt, target) {
+    const concrete = findChaoxingOptionLi(q, opt?.label, opt?.text) || findVisualOptionByPosition(q, opt?.label, opt?.text) || opt?.el;
+    return isSelected(concrete) || isSelected(opt?.el) || isSelected(target);
   }
 
   async function ensureQuestionVisible(q) {
@@ -1321,21 +1358,22 @@
     }
   }
 
-  async function clickOption(opt, q) {
+  async function clickOption(opt, q, opts = {}) {
     const root = q?.root || opt.root || opt.el;
     const concrete = findChaoxingOptionLi(q, opt.label, opt.text);
     if (concrete) opt = { ...opt, el: concrete, val: concrete.getAttribute?.('val-param') || opt.val, selected: () => isSelected(concrete) };
-    if (optionConfirmed(q, opt, opt.el)) return true;
+    const confirm = opts.ignoreAnswerValue ? optionUiConfirmed : optionConfirmed;
+    if (confirm(q, opt, opt.el)) return true;
     const before = answerStateSignature(root);
     const targets = optionClickTargets(opt, q);
     for (const target of targets) {
       dispatchClick(target);
       for (let i = 0; i < 2; i++) {
         await sleep(30);
-        if (optionConfirmed(q, opt, target)) return true;
+        if (confirm(q, opt, target)) return true;
       }
       const after = answerStateSignature(root);
-      if (after && after !== before && optionConfirmed(q, opt, target)) return true;
+      if (after && after !== before && confirm(q, opt, target)) return true;
     }
     // 兜底：部分新版学习通页面把选项做成自定义组件，普通 click 不改变 DOM。
     // 这里写入真实 radio/checkbox/answer 字段，并补一个纯展示用的选中态，避免“填上了但看不出来”。
@@ -1403,16 +1441,23 @@
       const targets = findOptionByAnswer(q, answer);
       if (!targets.length) return false;
       let changed = false;
-      if (q.typeText === '多选题') {
-        // 多选必须逐个目标确认；不能只选中第一个就算整题成功。
+      const multiMode = q.typeText === '多选题' || targets.length > 1;
+      if (multiMode) {
+        q.__cxllmForceMulti = true;
+        // 多选必须逐个真实点击；点击完成后再写入整题隐藏答案，避免预写值导致后续选项被误判为已选。
+        const fullValue = fullMultiAnswerValue(targets);
         let allOk = true;
         for (const opt of targets) {
-          const already = optionConfirmed(q, opt, opt.el) || opt.selected?.();
-          const ok = already || await clickOption(opt, q);
+          const target = optionTargetFor(q, opt);
+          const already = optionUiConfirmed(q, opt, target || opt.el) || opt.selected?.();
+          const ok = already || await clickOption(opt, q, { ignoreAnswerValue: true });
+          if (ok && target) markVisualPicked(q, opt, target);
           changed = ok || changed;
           if (!ok) allOk = false;
           await sleep(40);
         }
+        setQuestionAnswerValue(q, fullValue);
+        delete q.__cxllmForceMulti;
         // 多选题只做补选，不自动取消，避免误删用户/页面已有选择。
         return allOk;
       } else {
@@ -2170,6 +2215,13 @@
   async function testClickQuestion(index = 1, label = 'A') {
     const q = extractQuestions()[Number(index) - 1];
     if (!q) return false;
+    const labels = parseLabels(label);
+    if (labels.length > 1) {
+      const ok = await applyAnswer(q, labels.join(''));
+      const data = debugQuestion(index);
+      console.log('[CX-LLM] testClickQuestion result', { ok, data });
+      return ok;
+    }
     const opt = optionByLabel(q, label) || { label, text: optionTextForLabel(q.typeText, label), root: q.root, el: q.root };
     const ok = await clickOption(opt, q);
     const data = debugQuestion(index);
