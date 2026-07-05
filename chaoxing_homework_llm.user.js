@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.5
+// @version      1.0.6
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -655,6 +655,79 @@
       .filter(el => !/搜索|search|keyword/i.test(el.name || el.id || el.placeholder || ''));
   }
 
+
+  function optionTextForLabel(typeText, label) {
+    const l = String(label || '').toUpperCase();
+    if (typeText === '判断题') {
+      if (l === 'A') return '对';
+      if (l === 'B') return '错';
+    }
+    return '';
+  }
+
+  function findSmallClickable(el, stopRoot) {
+    let n = el;
+    let best = el;
+    for (let depth = 0; n && depth < 6 && n !== stopRoot?.parentElement; depth++, n = n.parentElement) {
+      if (!visible(n)) continue;
+      best = n;
+      if (n.matches?.('li,label,a,button,[onclick],[role="button"],[id-param],[val-param]')) return n;
+      const txt = cleanText(n.innerText || n.textContent || '');
+      if (txt.length > 0 && txt.length <= 20) best = n;
+    }
+    return best;
+  }
+
+  function findOptionElementInRoot(root, label, text = '') {
+    if (!root) return null;
+    const l = String(label || '').toUpperCase();
+    const exact = [];
+    const nodes = Array.from(root.querySelectorAll('li,label,a,button,span,div,em,[id-param],[val-param]'))
+      .filter(el => !el.closest(`#${PANEL_ID}`))
+      .filter(visible);
+    for (const el of nodes) {
+      const idp = String(el.getAttribute('id-param') || el.getAttribute('data') || '').toUpperCase();
+      const val = String(el.getAttribute('val-param') || '').toLowerCase();
+      const txt = cleanText(el.innerText || el.textContent || el.value || '');
+      if (idp === l) exact.push(el);
+      if (text && norm(txt) === norm(text)) exact.push(el);
+      if (text && new RegExp(`(^|\\s)${escapeReg(l)}\\s*[.、．]?\\s*${escapeReg(text)}($|\\s)`, 'i').test(txt)) exact.push(el);
+      if (l === 'A' && /^(true|1)$/.test(val)) exact.push(el);
+      if (l === 'B' && /^(false|0)$/.test(val)) exact.push(el);
+    }
+    const picked = exact
+      .map(el => findSmallClickable(el, root))
+      .filter(Boolean)
+      .sort((a, b) => cleanText(a.innerText || a.textContent || '').length - cleanText(b.innerText || b.textContent || '').length)[0];
+    return picked || null;
+  }
+
+  function inlineOptionsFromText(root, typeText) {
+    const txt = cleanText(root?.innerText || root?.textContent || '');
+    const out = [];
+    if (typeText === '判断题' || /A\s*(对|正确|是|true)\s*B\s*(错|错误|否|false)/i.test(txt)) {
+      const pairs = [
+        ['A', (/A\s*(正确|对|是|true)/i.exec(txt) || [])[1] || '对'],
+        ['B', (/B\s*(错误|错|否|false)/i.exec(txt) || [])[1] || '错']
+      ];
+      for (const [label, text] of pairs) {
+        const el = findOptionElementInRoot(root, label, text) || root;
+        out.push({ label, text, el, selected: () => isSelected(el), val: label === 'A' ? 'true' : 'false', synthetic: true });
+      }
+      return out;
+    }
+    const re = /(?:^|\s)([A-H])\s*[.、．]?\s*([^A-H\n]{1,80})(?=\s+[A-H]\s*[.、．]?\s|$)/g;
+    let m;
+    while ((m = re.exec(txt))) {
+      const label = m[1].toUpperCase();
+      const text = cleanText(m[2]);
+      if (!text || /^(单选题|多选题|判断题)$/.test(text)) continue;
+      const el = findOptionElementInRoot(root, label, text) || root;
+      out.push({ label, text, el, selected: () => isSelected(el), val: '', synthetic: true });
+    }
+    return uniqBy(out, o => `${o.label}:${norm(o.text)}`);
+  }
+
   function extractOptionsFromRoot(root) {
     const raw = [];
     const selectors = [
@@ -681,7 +754,7 @@
     });
     const out = [];
     optionEls.forEach((el, idx) => {
-      const em = el.querySelector('em[id-param],[id-param]');
+      const em = el.matches?.('em[id-param],[id-param]') ? el : el.querySelector('em[id-param],[id-param]');
       let label = (em?.getAttribute('id-param') || el.getAttribute('data') || '').trim();
       const txt = cleanText(el.innerHTML || el.innerText);
       const m = txt.match(/^\s*([A-H])(?:[.、\s]|$)/i);
@@ -700,15 +773,17 @@
         val: el.getAttribute('val-param') || ''
       });
     });
-    return uniqBy(out, o => `${o.label}:${norm(o.text)}:${cssPath(o.el)}`);
+    const normal = uniqBy(out, o => `${o.label}:${norm(o.text)}:${cssPath(o.el)}`);
+    return normal.length ? normal : inlineOptionsFromText(root, inferType(root));
   }
 
   function extractQuestions() {
     const roots = getQuestionRoots();
     const questions = [];
     roots.forEach((root, i) => {
-      const options = extractOptionsFromRoot(root);
       const typeText = inferType(root);
+      let options = extractOptionsFromRoot(root);
+      if (!options.length) options = inlineOptionsFromText(root, typeText);
       const question = titleText(root, options);
       if (!question || question.length < 2) return;
       let id = root.getAttribute('data-questionid') || root.getAttribute('qid') || '';
@@ -731,9 +806,11 @@
 
   function clickOption(opt) {
     const el = opt.el;
-    const target = el.querySelector('input[type="radio"],input[type="checkbox"]') || el;
-    target.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-    target.click();
+    const target = el.querySelector?.('input[type="radio"],input[type="checkbox"]') || el;
+    for (const type of ['mouseover', 'mousedown', 'mouseup', 'click']) {
+      target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: W }));
+    }
+    target.click?.();
     target.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
@@ -756,6 +833,9 @@
     if (/^[A-H]$/.test(normalized)) {
       const idx = normalized.charCodeAt(0) - 65;
       if (idx >= 0 && idx < q.options.length) return q.options[idx];
+      const text = optionTextForLabel(q.typeText, normalized);
+      const el = findOptionElementInRoot(q.root, normalized, text);
+      if (el) return { label: normalized, text, el, selected: () => isSelected(el), val: normalized === 'A' ? 'true' : 'false', synthetic: true };
     }
     return null;
   }
@@ -802,6 +882,14 @@
         if (!opt.selected()) clickOption(opt);
       }
       return true;
+    }
+    const labels = parseLabels(answer);
+    if (labels.length) {
+      const targets = labels.map(l => optionByLabel(q, l)).filter(Boolean);
+      if (targets.length) {
+        targets.forEach(clickOption);
+        return true;
+      }
     }
     if (q.inputs.length) {
       for (const input of q.inputs) {
@@ -1215,6 +1303,18 @@
     return true;
   }
 
+
+  function ensureUnfinishedListView() {
+    if (!/\/work\/list/i.test(location.pathname)) return false;
+    const url = new URL(location.href);
+    if (url.searchParams.get('status') === '-1') return false;
+    url.searchParams.set('status', '-1');
+    log('切换到“未完成”作业列表');
+    markPendingContinue();
+    location.href = url.href;
+    return true;
+  }
+
   async function enterNextWork(options = {}) {
     const { stopOnMiss = true, frameFallback = IS_TOP, clickFilter = true } = options;
     if (clickFilter) {
@@ -1252,6 +1352,7 @@
     touchRunning(false);
     try { W.confirm = () => true; } catch (_) {}
     await sleep(800);
+    if (ensureUnfinishedListView()) return;
     const qs = extractQuestions();
     if (qs.length) {
       await answerCurrentPage(true);
