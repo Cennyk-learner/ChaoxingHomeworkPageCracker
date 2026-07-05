@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.10
+// @version      1.0.11
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -967,8 +967,9 @@
         if (n.matches?.('li,label,a,button,[onclick],[role="button"],[val-param]')) break;
       }
     };
-    add(findChaoxingOptionLi(q, label, text));
-    visualOptionClickTargets(q, label, text).forEach(add);
+    const preciseLi = findChaoxingOptionLi(q, label, text);
+    add(preciseLi);
+    if (!preciseLi) visualOptionClickTargets(q, label, text).forEach(add);
     add(opt.el);
     if (root?.querySelectorAll) {
       const nodes = Array.from(root.querySelectorAll('input,li,label,a,button,span,div,em,[id-param],[val-param]'))
@@ -1189,6 +1190,7 @@
       changed = true;
     }
 
+    if (changed && target) markVisualPicked(q, opt, target);
     return changed;
   }
 
@@ -1262,15 +1264,15 @@
     const targets = optionClickTargets(opt, q);
     for (const target of targets) {
       dispatchClick(target);
-      for (let i = 0; i < 2; i++) {
-        await sleep(35);
+      for (let i = 0; i < 6; i++) {
+        await sleep(80);
         if (optionConfirmed(q, opt, target)) return true;
       }
       const after = answerStateSignature(root);
       if (after && after !== before && optionConfirmed(q, opt, target)) return true;
     }
     // 兜底：部分新版学习通页面把选项做成自定义组件，普通 click 不改变 DOM。
-    // 这里只写真实 radio/checkbox/answer 字段；不再伪造可见选中态，避免误判成功。
+    // 这里写入真实 radio/checkbox/answer 字段，并补一个纯展示用的选中态，避免“填上了但看不出来”。
     if (forceSetAnswer(q, opt)) {
       await sleep(80);
       if (optionConfirmed(q, opt, opt.el)) return true;
@@ -1368,6 +1370,25 @@
     return false;
   }
 
+  function runPooled(items, limit, worker) {
+    const resolvers = new Array(items.length);
+    const promises = items.map((_, i) => new Promise(resolve => { resolvers[i] = resolve; }));
+    let cursor = 0;
+    async function workerLoop() {
+      while (cursor < items.length) {
+        const i = cursor++;
+        try {
+          resolvers[i](await worker(items[i], i));
+        } catch (e) {
+          resolvers[i]({ __error: e });
+        }
+      }
+    }
+    const n = Math.min(limit, items.length) || 0;
+    for (let k = 0; k < n; k++) workerLoop();
+    return promises;
+  }
+
   async function answerCurrentPage(allowAfterAction = true) {
     const cfg = getCfg();
     const questions = extractQuestions();
@@ -1382,6 +1403,7 @@
     }
     let ok = 0, fail = 0;
     const allAnswers = [];
+    const pending = runPooled(batches, 4, batch => askLLM(batch));
     for (let bi = 0; bi < batches.length; bi++) {
       if (!isRunning() && allowAfterAction) {
         log('运行已停止，退出答题', 'warn');
@@ -1390,14 +1412,13 @@
       touchRunning(false);
       const batch = batches[bi];
       log(`调用模型：第 ${bi + 1}/${batches.length} 批（${batch.length} 题）`);
-      let answers;
-      try {
-        answers = await askLLM(batch);
-      } catch (e) {
-        log(`模型调用失败：${e.message || e}`, 'error');
+      const result = await pending[bi];
+      if (result && result.__error) {
+        log(`模型调用失败：${result.__error.message || result.__error}`, 'error');
         fail += batch.length;
         continue;
       }
+      const answers = result;
       allAnswers.push(...answers);
       const byId = new Map();
       answers.forEach((a, idx) => {
@@ -1785,11 +1806,19 @@
     });
   }
 
+  function neutralizeTargets(root) {
+    if (!root) return;
+    if (root.matches?.('a[target]')) root.removeAttribute('target');
+    if (root.querySelectorAll) root.querySelectorAll('a[target]').forEach(a => a.removeAttribute('target'));
+  }
+
   function activateWorkCandidate(work) {
     if (work.url) {
       location.href = work.url;
       return true;
     }
+    neutralizeTargets(work.row);
+    neutralizeTargets(work.el);
     const titleTarget = findWorkTarget(work.row);
     const targets = uniqBy([titleTarget, work.el, work.row].filter(Boolean), cssPath);
     let clicked = false;
@@ -1806,6 +1835,7 @@
         return t.length < 30 && words.some(w => t.includes(w));
       });
     if (!els.length) return false;
+    neutralizeTargets(els[0]);
     log(`点击进入按钮：${cleanText(els[0].value || els[0].innerText)}`);
     markPendingContinue();
     els[0].click();
