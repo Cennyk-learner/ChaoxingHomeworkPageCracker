@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.15
+// @version      1.0.16
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -1309,6 +1309,18 @@
     return optionValueConfirmed(q, { ...opt, el: concrete }) || isSelected(concrete) || isSelected(opt?.el) || isSelected(target);
   }
 
+  async function ensureQuestionVisible(q) {
+    const root = q?.root;
+    if (!root?.getBoundingClientRect) return;
+    const r = root.getBoundingClientRect();
+    const topLimit = 92;
+    const bottomLimit = Math.max(220, W.innerHeight - 120);
+    if (r.top < topLimit || r.top > bottomLimit || r.bottom < topLimit || r.bottom > W.innerHeight + 260) {
+      try { root.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+      await sleep(120);
+    }
+  }
+
   async function clickOption(opt, q) {
     const root = q?.root || opt.root || opt.el;
     const concrete = findChaoxingOptionLi(q, opt.label, opt.text);
@@ -1392,13 +1404,17 @@
       if (!targets.length) return false;
       let changed = false;
       if (q.typeText === '多选题') {
-        const wanted = new Set(targets);
-        for (const opt of q.options) {
-          const should = wanted.has(opt);
-          const selected = opt.selected();
-          if (should && !selected) changed = (await clickOption(opt, q)) || changed;
+        // 多选必须逐个目标确认；不能只选中第一个就算整题成功。
+        let allOk = true;
+        for (const opt of targets) {
+          const already = optionConfirmed(q, opt, opt.el) || opt.selected?.();
+          const ok = already || await clickOption(opt, q);
+          changed = ok || changed;
+          if (!ok) allOk = false;
+          await sleep(40);
         }
         // 多选题只做补选，不自动取消，避免误删用户/页面已有选择。
+        return allOk;
       } else {
         changed = await clickOption(targets[0], q);
       }
@@ -1514,6 +1530,7 @@
         const q = batch[i];
         const a = byId.get(q.id) || answers[i] || {};
         const ans = a.answer ?? a.answers ?? a.option ?? a.result ?? '';
+        await ensureQuestionVisible(q);
         const done = await applyAnswer(q, ans);
         if (done) {
           ok++;
