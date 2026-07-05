@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.19
+// @version      1.0.21
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -1153,6 +1153,111 @@
     try { el.dispatchEvent(new Event('blur', { bubbles: true })); } catch (_) {}
   }
 
+
+  function clearPickedNode(el) {
+    if (!el || el.closest?.(`#${PANEL_ID}`)) return false;
+    const nodes = uniqBy([el, ...Array.from(el.querySelectorAll?.('[data-cxllm-picked="1"],[data-cxllm-picked-dot="1"],.cur,.selected,.active,.checked,.on,.check_answer,.chosen,.current,[aria-checked="true"],[aria-selected="true"]') || [])], cssPath);
+    for (const node of nodes) {
+      try { node.classList?.remove('cur', 'selected', 'active', 'checked', 'on', 'check_answer', 'chosen', 'current'); } catch (_) {}
+      try { node.removeAttribute?.('data-cxllm-picked'); } catch (_) {}
+      if (node.getAttribute?.('data-cxllm-picked-dot') === '1') {
+        try { node.removeAttribute('data-cxllm-picked-dot'); } catch (_) {}
+        try {
+          node.style.background = '';
+          node.style.borderColor = '';
+          node.style.color = '';
+        } catch (_) {}
+      }
+      if (node.getAttribute?.('aria-checked') === 'true') node.setAttribute('aria-checked', 'false');
+      if (node.getAttribute?.('aria-selected') === 'true') node.setAttribute('aria-selected', 'false');
+    }
+    try { el.style.background = ''; } catch (_) {}
+    return true;
+  }
+
+  function optionInputsForTarget(q, opt, target) {
+    const scopes = uniqBy([target, target?.parentElement, opt?.el, opt?.el?.parentElement, q?.root].filter(Boolean), cssPath);
+    const label = String(opt?.label || '').toUpperCase();
+    const key = questionKey(q);
+    const inputs = [];
+    for (const scope of scopes) {
+      for (const input of Array.from(scope.querySelectorAll?.('input[type="radio"],input[type="checkbox"]') || [])) {
+        const name = String(input.name || input.id || '');
+        const value = String(input.value || input.getAttribute('value') || '').toUpperCase();
+        const nearLabel = optionLabelFromElement(input.closest?.('li,label,span,div') || input);
+        const sameKey = !key || !name || name.includes(key) || scope === target || target?.contains?.(input);
+        if (sameKey && (!label || value === label || nearLabel === label || target?.contains?.(input))) inputs.push(input);
+      }
+    }
+    return uniqBy(inputs, cssPath);
+  }
+
+  function forceOptionChecked(q, opt, checked) {
+    const target = optionTargetFor(q, opt);
+    let changed = false;
+    for (const input of optionInputsForTarget(q, opt, target)) {
+      setNativeChecked(input, checked);
+      if (checked) input.setAttribute('checked', 'checked');
+      else input.removeAttribute('checked');
+      dispatchInputChange(input);
+      changed = true;
+    }
+    if (!checked && target) {
+      const picked = optionContainerAround(target, String(opt?.label || '').toUpperCase(), opt?.text || '') || target;
+      changed = clearPickedNode(picked) || changed;
+    }
+    return changed;
+  }
+
+  async function deselectOption(q, opt) {
+    const target = optionTargetFor(q, opt);
+    if (optionUiConfirmed(q, opt, target || opt?.el)) {
+      for (const clickTarget of optionClickTargets(opt, q).slice(0, 4)) {
+        dispatchClick(clickTarget);
+        await sleep(35);
+        if (!optionUiConfirmed(q, opt, target || opt?.el)) break;
+      }
+    }
+    forceOptionChecked(q, opt, false);
+    if (target) clearPickedNode(optionContainerAround(target, String(opt?.label || '').toUpperCase(), opt?.text || '') || target);
+  }
+
+  function multiAnswerSets(q, targets) {
+    const wanted = new Set(targets.map(o => String(o?.label || '').toUpperCase()).filter(Boolean));
+    const all = q.options?.length ? q.options : [...'ABCDEFGH'].map(label => optionByLabel(q, label)).filter(Boolean);
+    return { wanted, all };
+  }
+
+  async function resetMultiQuestionToTargets(q, targets) {
+    const { wanted, all } = multiAnswerSets(q, targets);
+    for (const opt of all) {
+      const label = String(opt?.label || '').toUpperCase();
+      if (label && !wanted.has(label)) await deselectOption(q, opt);
+    }
+    // 清空隐藏答案，后面逐项点击完成后再写入精确的 ABCD，避免保留上一次多选残值。
+    setQuestionAnswerValue(q, '');
+    await sleep(30);
+  }
+
+  async function verifyMultiQuestionExact(q, targets) {
+    const { wanted, all } = multiAnswerSets(q, targets);
+    let ok = true;
+    for (const opt of all) {
+      const label = String(opt?.label || '').toUpperCase();
+      if (!label || wanted.has(label)) continue;
+      const target = optionTargetFor(q, opt);
+      if (optionUiConfirmed(q, opt, target || opt?.el)) {
+        await deselectOption(q, opt);
+        if (optionUiConfirmed(q, opt, target || opt?.el)) ok = false;
+      }
+    }
+    for (const opt of targets) {
+      const target = optionTargetFor(q, opt);
+      if (!optionUiConfirmed(q, opt, target || opt?.el) && !optionValueConfirmed(q, opt)) ok = false;
+    }
+    return ok;
+  }
+
   function markVisualPicked(q, opt, target) {
     if (!target) return false;
     const picked = optionContainerAround(target, String(opt?.label || '').toUpperCase(), opt?.text || '') || target;
@@ -1358,6 +1463,38 @@
     }
   }
 
+
+  function scrollableContainersFor(root) {
+    const out = [D.scrollingElement, D.documentElement, D.body].filter(Boolean);
+    for (let n = root?.parentElement; n; n = n.parentElement) {
+      try {
+        if (n.scrollHeight > n.clientHeight + 80) out.push(n);
+      } catch (_) {}
+    }
+    const active = Array.from(D.querySelectorAll('main,section,article,div'))
+      .filter(el => !el.closest(`#${PANEL_ID}`))
+      .filter(el => {
+        try {
+          const st = getComputedStyle(el);
+          return el.scrollTop > 0 && el.scrollHeight > el.clientHeight + 120 && /(auto|scroll|overlay)/i.test(st.overflowY || st.overflow);
+        } catch (_) { return false; }
+      })
+      .slice(0, 12);
+    out.push(...active);
+    return uniqBy(out, el => el === D.scrollingElement ? 'scrollingElement' : cssPath(el));
+  }
+
+  async function ensureTopBeforeFirstFill(q) {
+    log('填第一题前回到题页顶部');
+    try { W.scrollTo({ top: 0, left: 0, behavior: 'instant' }); } catch (_) { try { W.scrollTo(0, 0); } catch (__) {} }
+    for (const el of scrollableContainersFor(q?.root)) {
+      try { el.scrollTop = 0; el.scrollLeft = 0; } catch (_) {}
+    }
+    await sleep(120);
+    try { q?.root?.scrollIntoView({ block: 'start', inline: 'nearest' }); } catch (_) {}
+    await sleep(180);
+  }
+
   async function clickOption(opt, q, opts = {}) {
     const root = q?.root || opt.root || opt.el;
     const concrete = findChaoxingOptionLi(q, opt.label, opt.text);
@@ -1444,22 +1581,27 @@
       const multiMode = q.typeText === '多选题' || targets.length > 1;
       if (multiMode) {
         q.__cxllmForceMulti = true;
-        // 多选必须逐个真实点击；点击完成后再写入整题隐藏答案，避免预写值导致后续选项被误判为已选。
+        // 多选要按模型答案精确同步：先清掉非目标选项，再逐个真实点击目标选项。
+        // 这样可避免上一轮/手动残留导致“模型 AC，页面却显示 ACD”。
         const fullValue = fullMultiAnswerValue(targets);
         let allOk = true;
-        for (const opt of targets) {
-          const target = optionTargetFor(q, opt);
-          const already = optionUiConfirmed(q, opt, target || opt.el) || opt.selected?.();
-          const ok = already || await clickOption(opt, q, { ignoreAnswerValue: true });
-          if (ok && target) markVisualPicked(q, opt, target);
-          changed = ok || changed;
-          if (!ok) allOk = false;
-          await sleep(40);
+        try {
+          await resetMultiQuestionToTargets(q, targets);
+          for (const opt of targets) {
+            const target = optionTargetFor(q, opt);
+            const already = optionUiConfirmed(q, opt, target || opt.el) || opt.selected?.();
+            const ok = already || await clickOption(opt, q, { ignoreAnswerValue: true });
+            if (ok && target) markVisualPicked(q, opt, target);
+            changed = ok || changed;
+            if (!ok) allOk = false;
+            await sleep(40);
+          }
+          setQuestionAnswerValue(q, fullValue);
+          allOk = (await verifyMultiQuestionExact(q, targets)) && allOk;
+          return allOk;
+        } finally {
+          delete q.__cxllmForceMulti;
         }
-        setQuestionAnswerValue(q, fullValue);
-        delete q.__cxllmForceMulti;
-        // 多选题只做补选，不自动取消，避免误删用户/页面已有选择。
-        return allOk;
       } else {
         changed = await clickOption(targets[0], q);
       }
@@ -1561,6 +1703,7 @@
       }
       allAnswers.push(...answers);
       log(`开始填题：第 ${bi + 1}/${batches.length} 批（${questionRangeText(batch)}）`);
+      if (bi === 0 && batch[0]?.index === 1) await ensureTopBeforeFirstFill(batch[0]);
       const byId = new Map();
       answers.forEach((a, idx) => {
         const id = String(a.id ?? a.question_id ?? a.no ?? a.index ?? batch[idx]?.id ?? '');
