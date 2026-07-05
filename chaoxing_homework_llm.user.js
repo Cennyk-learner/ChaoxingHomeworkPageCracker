@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.7
+// @version      1.0.8
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -665,13 +665,123 @@
     return '';
   }
 
+  function questionKey(q) {
+    const ids = [];
+    if (q?.id) ids.push(q.id);
+    const root = q?.root || q;
+    if (root?.querySelectorAll) {
+      const inputs = Array.from(root.querySelectorAll('input[name*="answer"],input[id*="answer"],input[id^="answertype"]'));
+      for (const input of inputs) ids.push(input.name || input.id || '');
+      const liIds = Array.from(root.querySelectorAll('li[id-param][val-param],.answerList li[id-param]'))
+        .map(li => li.getAttribute('id-param'))
+        .filter(Boolean);
+      const uniq = [...new Set(liIds)];
+      if (uniq.length === 1) ids.push(uniq[0]);
+    }
+    for (const raw of ids) {
+      const s = String(raw || '').trim();
+      if (!s) continue;
+      const cleaned = s.replace(/^(answer|check|type|answertype)/i, '');
+      if (/^\d{3,}$/.test(cleaned)) return cleaned;
+      const m = s.match(/(?:answer|check|type|answertype)(\d{3,})/i) || s.match(/\b(\d{5,})\b/);
+      if (m) return m[1];
+    }
+    return '';
+  }
+
+  function optionLabelFromElement(el) {
+    if (!el) return '';
+    const attrNames = ['data-option', 'data-label', 'option', 'data'];
+    const idp = String(el.getAttribute?.('id-param') || '').trim().toUpperCase();
+    if (/^[A-H]$/.test(idp)) return idp;
+    for (const name of attrNames) {
+      const v = String(el.getAttribute?.(name) || '').trim().toUpperCase();
+      if (/^[A-H]$/.test(v)) return v;
+    }
+    const child = Array.from(el.querySelectorAll?.('[id-param],em,span,i,b') || [])
+      .find(x => {
+        const a = String(x.getAttribute?.('id-param') || '').trim().toUpperCase();
+        const t = cleanText(x.innerText || x.textContent || '').trim().toUpperCase();
+        return /^[A-H]$/.test(a) || /^[A-H]$/.test(t);
+      });
+    if (child) {
+      const a = String(child.getAttribute?.('id-param') || '').trim().toUpperCase();
+      if (/^[A-H]$/.test(a)) return a;
+      const t = cleanText(child.innerText || child.textContent || '').trim().toUpperCase();
+      if (/^[A-H]$/.test(t)) return t;
+    }
+    const txt = cleanText(el.innerText || el.textContent || el.value || '');
+    const m = txt.match(/^\s*([A-H])(?:[.、．\s]|$)/i);
+    return m ? m[1].toUpperCase() : '';
+  }
+
+  function optionTextFromElement(el, label = '') {
+    if (!el) return '';
+    const a = Array.from(el.querySelectorAll?.('a') || []).map(x => cleanText(x.innerText || x.textContent || '')).find(Boolean);
+    let text = a || cleanText(el.innerText || el.textContent || el.value || '');
+    const l = String(label || optionLabelFromElement(el) || '').toUpperCase();
+    if (l) text = text.replace(new RegExp(`^\\s*${escapeReg(l)}\\s*[.、．]?\\s*`, 'i'), '');
+    return cleanText(text);
+  }
+
+  function chaoxingOptionLis(scope) {
+    const root = scope?.querySelectorAll ? scope : D;
+    const raw = Array.from(root.querySelectorAll('li[id-param][val-param],.answerList li[id-param],.Zy_ulTop li[id-param],.optionUl li[id-param],.options li[id-param]'));
+    return uniqBy(raw, cssPath)
+      .filter(el => !el.closest(`#${PANEL_ID}`))
+      .filter(visible)
+      .filter(el => {
+        const label = optionLabelFromElement(el);
+        const val = String(el.getAttribute('val-param') || '').toLowerCase();
+        return /^[A-H]$/.test(label) || /^(true|false|0|1)$/.test(val);
+      });
+  }
+
+  function findChaoxingOptionLi(q, label, text = '') {
+    const root = q?.root || D;
+    const l = String(label || '').toUpperCase();
+    if (!/^[A-H]$/.test(l)) return null;
+    const wantedText = cleanText(text || optionTextForLabel(q?.typeText, l));
+    const key = questionKey(q);
+    const scopes = uniqBy([root, D].filter(Boolean), el => el === D ? 'document' : cssPath(el));
+    const cands = [];
+    for (const scope of scopes) cands.push(...chaoxingOptionLis(scope));
+    const scored = uniqBy(cands, cssPath).map(li => {
+      const liKey = String(li.getAttribute('id-param') || '').trim();
+      const liLabel = optionLabelFromElement(li);
+      const liVal = String(li.getAttribute('val-param') || '').toLowerCase();
+      const liText = optionTextFromElement(li, liLabel);
+      const keyKnown = !!(key && liKey);
+      const keyMatch = keyKnown && liKey === key;
+      if (keyKnown && !keyMatch) return null;
+      let matched = false;
+      let score = 100;
+      if (root?.contains?.(li)) score -= 20;
+      if (keyMatch) score -= 50;
+      if (liLabel === l) { score -= 45; matched = true; }
+      const wt = norm(wantedText);
+      const lt = norm(liText);
+      if (wt && lt && wt === lt) { score -= 30; matched = true; }
+      if (wt && lt && (lt.includes(wt) || wt.includes(lt))) { score -= 12; matched = true; }
+      if (q?.typeText === '判断题' || /^(对|错|正确|错误)$/.test(wantedText)) {
+        if (l === 'A' && /^(true|1)$/.test(liVal)) { score -= 40; matched = true; }
+        if (l === 'B' && /^(false|0)$/.test(liVal)) { score -= 40; matched = true; }
+      }
+      if (!matched) return null;
+      score += Math.min(cleanText(li.innerText || li.textContent || '').length / 10, 15);
+      return { li, score };
+    }).filter(Boolean);
+    scored.sort((a, b) => a.score - b.score);
+    return scored[0]?.li || null;
+  }
+
   function findSmallClickable(el, stopRoot) {
     let n = el;
     let best = el;
     for (let depth = 0; n && depth < 6 && n !== stopRoot?.parentElement; depth++, n = n.parentElement) {
       if (!visible(n)) continue;
       best = n;
-      if (n.matches?.('li,label,a,button,[onclick],[role="button"],[id-param],[val-param]')) return n;
+      if (n.matches?.('li,label,a,button,[onclick],[role="button"],[val-param]')) return n;
       const txt = cleanText(n.innerText || n.textContent || '');
       if (txt.length > 0 && txt.length <= 20) best = n;
     }
@@ -681,6 +791,8 @@
   function findOptionElementInRoot(root, label, text = '') {
     if (!root) return null;
     const l = String(label || '').toUpperCase();
+    const chaoxingLi = findChaoxingOptionLi({ root, typeText: '' }, l, text);
+    if (chaoxingLi) return chaoxingLi;
     const exact = [];
     const nodes = Array.from(root.querySelectorAll('li,label,a,button,span,div,em,[id-param],[val-param]'))
       .filter(el => !el.closest(`#${PANEL_ID}`))
@@ -688,8 +800,9 @@
     for (const el of nodes) {
       const idp = String(el.getAttribute('id-param') || el.getAttribute('data') || '').toUpperCase();
       const val = String(el.getAttribute('val-param') || '').toLowerCase();
+      const elLabel = optionLabelFromElement(el);
       const txt = cleanText(el.innerText || el.textContent || el.value || '');
-      if (idp === l) exact.push(el);
+      if (idp === l || elLabel === l) exact.push(el);
       if (text && norm(txt) === norm(text)) exact.push(el);
       if (text && new RegExp(`(^|\\s)${escapeReg(l)}\\s*[.、．]?\\s*${escapeReg(text)}($|\\s)`, 'i').test(txt)) exact.push(el);
       if (l === 'A' && /^(true|1)$/.test(val)) exact.push(el);
@@ -758,10 +871,11 @@
       let label = (em?.getAttribute('id-param') || el.getAttribute('data') || '').trim();
       const txt = cleanText(el.innerHTML || el.innerText);
       const m = txt.match(/^\s*([A-H])(?:[.、\s]|$)/i);
+      if (!/^[A-H]$/i.test(label)) label = optionLabelFromElement(el);
       if (!label && m) label = m[1].toUpperCase();
       if (!/^[A-H]$/i.test(label)) label = String.fromCharCode(65 + idx);
       label = label.toUpperCase();
-      let text = cleanText(el.innerText);
+      let text = optionTextFromElement(el, label) || cleanText(el.innerText);
       text = text.replace(new RegExp(`^\\s*${escapeReg(label)}\\s*[.、．]?\\s*`, 'i'), '').trim();
       text = text.replace(/^([A-H])\s+/, '').trim();
       if (!text && el.getAttribute('val-param')) text = el.getAttribute('val-param') === 'true' ? '对' : '错';
@@ -803,6 +917,8 @@
     if (/( cur | checked | selected | active | on | check_answer | chosen | current )/i.test(cls)) return true;
     if (el.getAttribute?.('aria-checked') === 'true' || el.getAttribute?.('aria-selected') === 'true') return true;
     const input = el.querySelector?.('input[type="radio"],input[type="checkbox"]');
+    const markedChild = el.querySelector?.('.cur,.checked,.selected,.active,.on,.check_answer,.chosen,.current,[aria-checked="true"],[aria-selected="true"]');
+    if (markedChild) return true;
     return !!input?.checked;
   }
 
@@ -830,9 +946,10 @@
       for (let i = 0; n && i < 5 && n !== root.parentElement; i++, n = n.parentElement) {
         if (!visible(n) || n.closest?.(`#${PANEL_ID}`)) continue;
         candidates.push(n);
-        if (n.matches?.('li,label,a,button,[onclick],[role="button"],[id-param],[val-param]')) break;
+        if (n.matches?.('li,label,a,button,[onclick],[role="button"],[val-param]')) break;
       }
     };
+    add(findChaoxingOptionLi(q, label, text));
     add(opt.el);
     if (root?.querySelectorAll) {
       const nodes = Array.from(root.querySelectorAll('input,li,label,a,button,span,div,em,[id-param],[val-param]'))
@@ -841,8 +958,9 @@
       for (const el of nodes) {
         const idp = String(el.getAttribute('id-param') || el.getAttribute('data') || '').toUpperCase();
         const val = String(el.getAttribute('val-param') || '').toLowerCase();
+        const elLabel = optionLabelFromElement(el);
         const txt = cleanText(el.innerText || el.textContent || el.value || '');
-        if (idp === label) add(el);
+        if (idp === label || elLabel === label) add(el.closest?.('li[id-param],li,label') || el);
         if (txt === label || (text && txt === text)) add(el);
         if (text && new RegExp(`(^|\\s)${escapeReg(label)}\\s*[.、．]?\\s*${escapeReg(text)}($|\\s)`, 'i').test(txt)) add(el);
         if (q?.typeText === '判断题' && label === 'A' && /^(true|1)$/.test(val)) add(el);
@@ -850,30 +968,78 @@
       }
     }
     return uniqBy(candidates, cssPath)
-      .sort((a, b) => cleanText(a.innerText || a.textContent || '').length - cleanText(b.innerText || b.textContent || '').length);
+      .sort((a, b) => {
+        const score = el => {
+          let s = cleanText(el.innerText || el.textContent || '').length;
+          if (el.matches?.('li[id-param],li[val-param]')) s -= 120;
+          if (el.matches?.('label,button,a,[onclick],[role="button"]')) s -= 60;
+          if (el.matches?.('em,span,i,b') && !el.matches?.('[onclick]')) s += 40;
+          return s;
+        };
+        return score(a) - score(b);
+      });
   }
 
   function dispatchClick(el) {
     try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
     try { el.focus?.(); } catch (_) {}
+    const rect = el.getBoundingClientRect?.();
+    const eventInit = {
+      bubbles: true,
+      cancelable: true,
+      view: W,
+      clientX: rect ? rect.left + rect.width / 2 : 0,
+      clientY: rect ? rect.top + rect.height / 2 : 0,
+      button: 0
+    };
     for (const type of ['pointerdown', 'mousedown', 'mouseup', 'pointerup', 'click']) {
-      try { el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: W })); } catch (_) {}
+      try {
+        const Evt = type.startsWith('pointer') && typeof W.PointerEvent === 'function' ? W.PointerEvent : W.MouseEvent;
+        el.dispatchEvent(new Evt(type, eventInit));
+      } catch (_) {}
     }
     try { el.click?.(); } catch (_) {}
     try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (_) {}
   }
 
+  function optionValueConfirmed(q, opt) {
+    const root = q?.root || opt?.root || opt?.el;
+    if (!root?.querySelectorAll) return false;
+    const label = String(opt?.label || '').toUpperCase();
+    const values = new Set([label, String(opt?.val || '').toLowerCase(), String(opt?.el?.getAttribute?.('val-param') || '').toLowerCase(), norm(opt?.text || '')].filter(Boolean));
+    if (q?.typeText === '判断题') {
+      if (label === 'A') ['true', '1', '对', '正确'].forEach(v => values.add(v));
+      if (label === 'B') ['false', '0', '错', '错误'].forEach(v => values.add(v));
+    }
+    const inputs = Array.from(root.querySelectorAll('input[name*="answer"],input[id*="answer"],textarea'))
+      .filter(el => !/^answertype/i.test(el.id || ''));
+    return inputs.some(input => {
+      if (input.matches?.('input[type="radio"],input[type="checkbox"]')) return input.checked && values.has(String(input.value || '').toLowerCase());
+      const v = cleanText(input.value || '');
+      return v && (values.has(v.toUpperCase()) || values.has(v.toLowerCase()) || values.has(norm(v)));
+    });
+  }
+
+  function optionConfirmed(q, opt, target) {
+    const concrete = findChaoxingOptionLi(q, opt?.label, opt?.text) || opt?.el;
+    return isSelected(concrete) || isSelected(opt?.el) || isSelected(target) || optionValueConfirmed(q, { ...opt, el: concrete });
+  }
+
   async function clickOption(opt, q) {
     const root = q?.root || opt.root || opt.el;
-    if (isSelected(opt.el)) return true;
+    const concrete = findChaoxingOptionLi(q, opt.label, opt.text);
+    if (concrete) opt = { ...opt, el: concrete, val: concrete.getAttribute?.('val-param') || opt.val, selected: () => isSelected(concrete) };
+    if (optionConfirmed(q, opt, opt.el)) return true;
     const before = answerStateSignature(root);
     const targets = optionClickTargets(opt, q);
     for (const target of targets) {
       dispatchClick(target);
-      await sleep(60);
-      if (isSelected(opt.el) || isSelected(target)) return true;
+      for (let i = 0; i < 8; i++) {
+        await sleep(90);
+        if (optionConfirmed(q, opt, target)) return true;
+      }
       const after = answerStateSignature(root);
-      if (after && after !== before) return true;
+      if (after && after !== before && optionConfirmed(q, opt, target)) return true;
     }
     return false;
   }
@@ -1015,7 +1181,9 @@
         } else {
           fail++;
           const optionInfo = q.options.map(o => `${o.label || '?'}:${o.text || o.val || ''}`).join(' | ');
-          log(`#${q.index} 未能匹配答案：${String(ans).slice(0, 100)}；页面选项：${optionInfo}`, 'warn');
+          const matched = q.options.length && findOptionByAnswer(q, ans).length;
+          const reason = matched ? '已匹配但页面未确认选中' : '未能匹配答案';
+          log(`#${q.index} ${reason}：${String(ans).slice(0, 100)}；页面选项：${optionInfo}`, 'warn');
         }
         await sleep(cfg.delayMs);
       }
