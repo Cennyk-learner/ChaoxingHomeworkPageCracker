@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.14
+// @version      1.0.15
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -1244,9 +1244,11 @@
     return changed;
   }
 
-  function dispatchClick(el) {
-    try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
-    try { el.focus?.(); } catch (_) {}
+  function dispatchClick(el, opts = {}) {
+    if (opts.scroll) {
+      try { el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (_) {}
+    }
+    try { el.focus?.({ preventScroll: true }); } catch (_) { try { el.focus?.(); } catch (__) {} }
     const rect = el.getBoundingClientRect?.();
     const eventInit = {
       bubbles: true,
@@ -1441,6 +1443,27 @@
     return promises;
   }
 
+  function startModelProgress(label) {
+    const started = Date.now();
+    let ticks = 0;
+    log(`${label}：已发送请求，等待模型思考...`);
+    const timer = setInterval(() => {
+      ticks++;
+      const sec = Math.round((Date.now() - started) / 1000);
+      log(`${label}：模型思考中 ${sec}s${'.'.repeat(ticks % 4)}`);
+    }, 8000);
+    return extra => {
+      clearInterval(timer);
+      const sec = ((Date.now() - started) / 1000).toFixed(1);
+      log(`${label}：模型返回，用时 ${sec}s${extra ? `，${extra}` : ''}`, 'ok');
+    };
+  }
+
+  function questionRangeText(batch) {
+    if (!batch.length) return '';
+    return `#${batch[0].index}-#${batch[batch.length - 1].index}`;
+  }
+
   async function answerCurrentPage(allowAfterAction = true) {
     const cfg = getCfg();
     const questions = extractQuestions();
@@ -1455,7 +1478,6 @@
     }
     let ok = 0, fail = 0, aborted = false;
     const allAnswers = [];
-    const pending = runPooled(batches, 4, batch => askLLM(batch));
     for (let bi = 0; bi < batches.length; bi++) {
       if (!isRunning() && allowAfterAction) {
         log('运行已停止，退出答题', 'warn');
@@ -1464,15 +1486,20 @@
       }
       touchRunning(false);
       const batch = batches[bi];
-      log(`调用模型：第 ${bi + 1}/${batches.length} 批（${batch.length} 题）`);
-      const result = await pending[bi];
-      if (result && result.__error) {
-        log(`模型调用失败：${result.__error.message || result.__error}`, 'error');
+      const label = `模型思考：第 ${bi + 1}/${batches.length} 批（${questionRangeText(batch)}，${batch.length} 题）`;
+      const stopProgress = startModelProgress(label);
+      let answers;
+      try {
+        answers = await askLLM(batch);
+        stopProgress(`收到 ${answers.length} 个答案`);
+      } catch (e) {
+        stopProgress('请求失败');
+        log(`模型调用失败：${e.message || e}`, 'error');
         fail += batch.length;
         continue;
       }
-      const answers = result;
       allAnswers.push(...answers);
+      log(`开始填题：第 ${bi + 1}/${batches.length} 批（${questionRangeText(batch)}）`);
       const byId = new Map();
       answers.forEach((a, idx) => {
         const id = String(a.id ?? a.question_id ?? a.no ?? a.index ?? batch[idx]?.id ?? '');
@@ -1497,6 +1524,9 @@
           const matched = q.options.length && findOptionByAnswer(q, ans).length;
           const reason = matched ? '已匹配但页面未确认选中' : '未能匹配答案';
           log(`#${q.index} ${reason}：${String(ans).slice(0, 100)}；页面选项：${optionInfo}`, 'warn');
+        }
+        if ((i + 1) % 10 === 0 || i === batch.length - 1) {
+          log(`填题进度：第 ${bi + 1}/${batches.length} 批 ${i + 1}/${batch.length}，累计成功 ${ok}，失败 ${fail}`);
         }
         await sleep(cfg.delayMs);
       }
