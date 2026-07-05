@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.12
+// @version      1.0.13
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -1122,6 +1122,29 @@
     return label || cleanText(opt?.text || '');
   }
 
+  function setNativeValue(el, value) {
+    try {
+      const proto = el instanceof W.HTMLTextAreaElement ? W.HTMLTextAreaElement.prototype : W.HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      if (setter) setter.call(el, value);
+      else el.value = value;
+      if (el._valueTracker) el._valueTracker.setValue('');
+    } catch (_) {
+      el.value = value;
+    }
+  }
+
+  function setNativeChecked(el, checked) {
+    try {
+      const setter = Object.getOwnPropertyDescriptor(W.HTMLInputElement.prototype, 'checked')?.set;
+      if (setter) setter.call(el, checked);
+      else el.checked = checked;
+      if (el._valueTracker) el._valueTracker.setValue(String(!checked));
+    } catch (_) {
+      el.checked = checked;
+    }
+  }
+
   function dispatchInputChange(el) {
     try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
     try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (_) {}
@@ -1143,12 +1166,37 @@
           if (el === picked || picked.contains?.(el)) return;
           el.classList.remove('cur', 'selected', 'active', 'checked', 'on');
           el.removeAttribute('data-cxllm-picked');
+          el.style.background = '';
+          Array.from(el.querySelectorAll?.('[data-cxllm-picked-dot="1"]') || []).forEach(dot => {
+            dot.removeAttribute('data-cxllm-picked-dot');
+            dot.style.background = '';
+            dot.style.borderColor = '';
+            dot.style.color = '';
+          });
           if (el.getAttribute('aria-checked') === 'true') el.setAttribute('aria-checked', 'false');
         });
     }
     picked.classList.add('cur', 'selected');
     picked.setAttribute('data-cxllm-picked', '1');
     picked.setAttribute('aria-checked', 'true');
+    try {
+      picked.style.background = '#eef6ff';
+      const label = String(opt?.label || '').toUpperCase();
+      const smalls = Array.from(picked.querySelectorAll?.('*') || [])
+        .filter(visible)
+        .filter(el => {
+          const r = el.getBoundingClientRect();
+          const t = cleanText(el.innerText || el.textContent || '');
+          return t === label || (r.width >= 18 && r.width <= 42 && r.height >= 18 && r.height <= 42 && t.length <= 2);
+        })
+        .slice(0, 3);
+      for (const el of smalls) {
+        el.setAttribute('data-cxllm-picked-dot', '1');
+        el.style.background = '#2f80ed';
+        el.style.borderColor = '#2f80ed';
+        el.style.color = '#fff';
+      }
+    } catch (_) {}
     return true;
   }
 
@@ -1164,7 +1212,7 @@
     for (const scope of inputScopes) {
       const inputs = Array.from(scope.querySelectorAll?.('input[type="radio"],input[type="checkbox"]') || []);
       for (const input of inputs) {
-        input.checked = true;
+        setNativeChecked(input, true);
         input.setAttribute('checked', 'checked');
         dispatchInputChange(input);
         changed = true;
@@ -1182,9 +1230,9 @@
     }
     for (const input of answerInputs) {
       if (q?.typeText === '多选题' && input.value && !String(input.value).includes(value)) {
-        input.value = `${input.value}${/[A-H]$/.test(String(input.value)) ? '' : ','}${value}`;
+        setNativeValue(input, `${input.value}${/[A-H]$/.test(String(input.value)) ? '' : ','}${value}`);
       } else {
-        input.value = value;
+        setNativeValue(input, value);
       }
       dispatchInputChange(input);
       changed = true;
@@ -1219,6 +1267,8 @@
       } catch (_) {}
     }
     try { el.click?.(); } catch (_) {}
+    try { W.jQuery?.(el).trigger?.('click'); } catch (_) {}
+    try { W.$?.(el).trigger?.('click'); } catch (_) {}
     try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (_) {}
   }
 
@@ -1264,8 +1314,8 @@
     const targets = optionClickTargets(opt, q);
     for (const target of targets) {
       dispatchClick(target);
-      for (let i = 0; i < 6; i++) {
-        await sleep(80);
+      for (let i = 0; i < 2; i++) {
+        await sleep(30);
         if (optionConfirmed(q, opt, target)) return true;
       }
       const after = answerStateSignature(root);
@@ -1930,35 +1980,63 @@
     }
   }
 
-  function debugQuestion(index = 1) {
+  function debugQuestion(index = 1, doCopy = false) {
     const q = extractQuestions()[Number(index) - 1];
     if (!q) return null;
+    const key = questionKey(q);
     const scopes = uniqBy([q.root, q.root?.parentElement, q.root?.parentElement?.parentElement].filter(Boolean), cssPath);
     const labels = q.options.length ? q.options.map(o => o.label).filter(Boolean) : ['A', 'B', 'C', 'D'];
     const candidates = [];
     for (const label of labels) {
       const text = q.options.find(o => o.label === label)?.text || optionTextForLabel(q.typeText, label);
-      visualOptionClickTargets(q, label, text).slice(0, 10).forEach(el => candidates.push({
-        label,
-        tag: el.tagName,
-        cls: String(el.className || '').slice(0, 80),
-        text: cleanText(el.innerText || el.textContent || el.value || '').slice(0, 80),
-        path: cssPath(el)
-      }));
+      visualOptionClickTargets(q, label, text).slice(0, 12).forEach(el => {
+        const r = el.getBoundingClientRect?.();
+        candidates.push({
+          label,
+          tag: el.tagName,
+          cls: String(el.className || '').slice(0, 120),
+          text: cleanText(el.innerText || el.textContent || el.value || '').slice(0, 120),
+          attrs: ['id','name','class','onclick','id-param','val-param','data','data-value','role','aria-checked'].map(a => [a, el.getAttribute?.(a)]).filter(x => x[1] != null).slice(0, 12),
+          rect: r ? [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)] : null,
+          html: String(el.outerHTML || '').replace(/\s+/g, ' ').slice(0, 260),
+          path: cssPath(el)
+        });
+      });
     }
-    const inputs = uniqBy(scopes.flatMap(scope => Array.from(scope.querySelectorAll?.('input,textarea,select') || [])), cssPath)
+    let inputs = uniqBy(scopes.flatMap(scope => Array.from(scope.querySelectorAll?.('input,textarea,select') || [])), cssPath)
+      .filter(el => {
+        const name = String(el.name || el.id || '');
+        return !key || name.includes(key) || /^answertype/i.test(el.id || '') || /^answertype/i.test(el.name || '');
+      })
+      .slice(0, 40)
       .map(el => ({
         tag: el.tagName,
         type: el.type || '',
         name: el.name || '',
         id: el.id || '',
-        value: String(el.value || '').slice(0, 80),
+        value: String(el.value || '').slice(0, 120),
         checked: !!el.checked,
+        html: String(el.outerHTML || '').replace(/\s+/g, ' ').slice(0, 220),
         path: cssPath(el)
       }));
-    const data = { id: q.id, index: q.index, type: q.typeText, question: q.question, key: questionKey(q), options: q.options.map(o => ({ label: o.label, text: o.text, val: o.val })), candidates, inputs };
+    const data = { id: q.id, index: q.index, type: q.typeText, question: q.question, key, options: q.options.map(o => ({ label: o.label, text: o.text, val: o.val, el: String(o.el?.outerHTML || '').replace(/\s+/g, ' ').slice(0, 220) })), candidates, inputs };
     console.log('[CX-LLM] debugQuestion', data);
+    if (doCopy) {
+      const text = JSON.stringify(data, null, 2);
+      try { navigator.clipboard?.writeText(text); log('debugQuestion 已复制到剪贴板', 'ok'); } catch (_) {}
+      return text;
+    }
     return data;
+  }
+
+  async function testClickQuestion(index = 1, label = 'A') {
+    const q = extractQuestions()[Number(index) - 1];
+    if (!q) return false;
+    const opt = optionByLabel(q, label) || { label, text: optionTextForLabel(q.typeText, label), root: q.root, el: q.root };
+    const ok = await clickOption(opt, q);
+    const data = debugQuestion(index);
+    console.log('[CX-LLM] testClickQuestion result', { ok, data });
+    return ok;
   }
 
   function exposeApi() {
@@ -1968,6 +2046,7 @@
       enterNextWork,
       debugWorkList,
       debugQuestion,
+      testClickQuestion,
       getCfg,
       setCfg,
       start: async () => { setRunning(true); await runController(); },
