@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.6
+// @version      1.0.7
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -712,7 +712,7 @@
       ];
       for (const [label, text] of pairs) {
         const el = findOptionElementInRoot(root, label, text) || root;
-        out.push({ label, text, el, selected: () => isSelected(el), val: label === 'A' ? 'true' : 'false', synthetic: true });
+        out.push({ label, text, el, root, selected: () => isSelected(el), val: label === 'A' ? 'true' : 'false', synthetic: true });
       }
       return out;
     }
@@ -723,7 +723,7 @@
       const text = cleanText(m[2]);
       if (!text || /^(单选题|多选题|判断题)$/.test(text)) continue;
       const el = findOptionElementInRoot(root, label, text) || root;
-      out.push({ label, text, el, selected: () => isSelected(el), val: '', synthetic: true });
+      out.push({ label, text, el, root, selected: () => isSelected(el), val: '', synthetic: true });
     }
     return uniqBy(out, o => `${o.label}:${norm(o.text)}`);
   }
@@ -769,6 +769,7 @@
         label,
         text,
         el,
+        root,
         selected: () => isSelected(el),
         val: el.getAttribute('val-param') || ''
       });
@@ -797,21 +798,84 @@
 
   function isSelected(el) {
     if (!el) return false;
-    if (el.matches('input')) return !!el.checked;
+    if (el.matches?.('input')) return !!el.checked;
     const cls = ` ${el.className || ''} `;
-    if (/( cur | checked | selected | active | on | check_answer )/i.test(cls)) return true;
-    const input = el.querySelector('input[type="radio"],input[type="checkbox"]');
+    if (/( cur | checked | selected | active | on | check_answer | chosen | current )/i.test(cls)) return true;
+    if (el.getAttribute?.('aria-checked') === 'true' || el.getAttribute?.('aria-selected') === 'true') return true;
+    const input = el.querySelector?.('input[type="radio"],input[type="checkbox"]');
     return !!input?.checked;
   }
 
-  function clickOption(opt) {
-    const el = opt.el;
-    const target = el.querySelector?.('input[type="radio"],input[type="checkbox"]') || el;
-    for (const type of ['mouseover', 'mousedown', 'mouseup', 'click']) {
-      target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: W }));
+  function answerStateSignature(root) {
+    if (!root) return '';
+    const inputs = Array.from(root.querySelectorAll('input,textarea,select'))
+      .map(el => `${el.tagName}:${el.type || ''}:${el.name || ''}:${el.id || ''}:${!!el.checked}:${el.value || ''}`)
+      .join('|');
+    const marked = Array.from(root.querySelectorAll('.cur,.checked,.selected,.active,.on,.chosen,.current,[aria-checked="true"],[aria-selected="true"]'))
+      .filter(el => !el.closest(`#${PANEL_ID}`))
+      .map(el => `${cssPath(el)}:${el.className || ''}`)
+      .join('|');
+    return `${inputs}##${marked}`;
+  }
+
+  function optionClickTargets(opt, q) {
+    const root = q?.root || opt.root || opt.el;
+    const label = String(opt.label || '').toUpperCase();
+    const text = cleanText(opt.text || '');
+    const candidates = [];
+    const add = el => {
+      if (!el || !visible(el) || el.closest?.(`#${PANEL_ID}`)) return;
+      candidates.push(el);
+      let n = el;
+      for (let i = 0; n && i < 5 && n !== root.parentElement; i++, n = n.parentElement) {
+        if (!visible(n) || n.closest?.(`#${PANEL_ID}`)) continue;
+        candidates.push(n);
+        if (n.matches?.('li,label,a,button,[onclick],[role="button"],[id-param],[val-param]')) break;
+      }
+    };
+    add(opt.el);
+    if (root?.querySelectorAll) {
+      const nodes = Array.from(root.querySelectorAll('input,li,label,a,button,span,div,em,[id-param],[val-param]'))
+        .filter(el => !el.closest(`#${PANEL_ID}`))
+        .filter(visible);
+      for (const el of nodes) {
+        const idp = String(el.getAttribute('id-param') || el.getAttribute('data') || '').toUpperCase();
+        const val = String(el.getAttribute('val-param') || '').toLowerCase();
+        const txt = cleanText(el.innerText || el.textContent || el.value || '');
+        if (idp === label) add(el);
+        if (txt === label || (text && txt === text)) add(el);
+        if (text && new RegExp(`(^|\\s)${escapeReg(label)}\\s*[.、．]?\\s*${escapeReg(text)}($|\\s)`, 'i').test(txt)) add(el);
+        if (q?.typeText === '判断题' && label === 'A' && /^(true|1)$/.test(val)) add(el);
+        if (q?.typeText === '判断题' && label === 'B' && /^(false|0)$/.test(val)) add(el);
+      }
     }
-    target.click?.();
-    target.dispatchEvent(new Event('change', { bubbles: true }));
+    return uniqBy(candidates, cssPath)
+      .sort((a, b) => cleanText(a.innerText || a.textContent || '').length - cleanText(b.innerText || b.textContent || '').length);
+  }
+
+  function dispatchClick(el) {
+    try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
+    try { el.focus?.(); } catch (_) {}
+    for (const type of ['pointerdown', 'mousedown', 'mouseup', 'pointerup', 'click']) {
+      try { el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: W })); } catch (_) {}
+    }
+    try { el.click?.(); } catch (_) {}
+    try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (_) {}
+  }
+
+  async function clickOption(opt, q) {
+    const root = q?.root || opt.root || opt.el;
+    if (isSelected(opt.el)) return true;
+    const before = answerStateSignature(root);
+    const targets = optionClickTargets(opt, q);
+    for (const target of targets) {
+      dispatchClick(target);
+      await sleep(60);
+      if (isSelected(opt.el) || isSelected(target)) return true;
+      const after = answerStateSignature(root);
+      if (after && after !== before) return true;
+    }
+    return false;
   }
 
   function parseLabels(answer) {
@@ -835,7 +899,7 @@
       if (idx >= 0 && idx < q.options.length) return q.options[idx];
       const text = optionTextForLabel(q.typeText, normalized);
       const el = findOptionElementInRoot(q.root, normalized, text);
-      if (el) return { label: normalized, text, el, selected: () => isSelected(el), val: normalized === 'A' ? 'true' : 'false', synthetic: true };
+      if (el) return { label: normalized, text, el, root: q.root, selected: () => isSelected(el), val: normalized === 'A' ? 'true' : 'false', synthetic: true };
     }
     return null;
   }
@@ -866,29 +930,31 @@
     return contains;
   }
 
-  function applyAnswer(q, answer) {
+  async function applyAnswer(q, answer) {
     if (q.options.length) {
       const targets = findOptionByAnswer(q, answer);
       if (!targets.length) return false;
-      const wanted = new Set(targets);
+      let changed = false;
       if (q.typeText === '多选题') {
+        const wanted = new Set(targets);
         for (const opt of q.options) {
           const should = wanted.has(opt);
           const selected = opt.selected();
-          if (should !== selected) clickOption(opt);
+          if (should && !selected) changed = (await clickOption(opt, q)) || changed;
         }
+        // 多选题只做补选，不自动取消，避免误删用户/页面已有选择。
       } else {
-        const opt = targets[0];
-        if (!opt.selected()) clickOption(opt);
+        changed = await clickOption(targets[0], q);
       }
-      return true;
+      return changed;
     }
     const labels = parseLabels(answer);
     if (labels.length) {
       const targets = labels.map(l => optionByLabel(q, l)).filter(Boolean);
       if (targets.length) {
-        targets.forEach(clickOption);
-        return true;
+        let ok = false;
+        for (const target of targets) ok = (await clickOption(target, q)) || ok;
+        return ok;
       }
     }
     if (q.inputs.length) {
@@ -942,7 +1008,7 @@
         const q = batch[i];
         const a = byId.get(q.id) || answers[i] || {};
         const ans = a.answer ?? a.answers ?? a.option ?? a.result ?? '';
-        const done = applyAnswer(q, ans);
+        const done = await applyAnswer(q, ans);
         if (done) {
           ok++;
           log(`#${q.index} ${q.typeText} => ${String(ans).slice(0, 80)}`, 'ok');
@@ -956,7 +1022,14 @@
     }
     W.__cxllm_last_answers = allAnswers;
     log(`填题完成：成功 ${ok}，失败/未填 ${fail}`, fail ? 'warn' : 'ok');
-    if (allowAfterAction) await afterAnswerAction();
+    if (allowAfterAction) {
+      if (fail > 0) {
+        log('存在未确认选中的题目，已阻止自动提交，请检查后手动提交或重试。', 'error');
+        setRunning(false);
+      } else {
+        await afterAnswerAction();
+      }
+    }
     return true;
   }
 
