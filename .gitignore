@@ -1,0 +1,8 @@
+超星.txt
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+node_modules/
+.env
+.env.*
