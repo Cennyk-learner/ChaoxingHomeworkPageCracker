@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.3
+// @version      1.0.4
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -288,6 +288,7 @@
           <button class="green" id="cxllm-save">保存配置</button>
           <button id="cxllm-start">开始</button>
           <button class="gray" id="cxllm-once">只答当前页</button>
+          <button class="gray" id="cxllm-debug-list">诊断列表</button>
           <button class="red" id="cxllm-stop">停止</button>
         </div>
         <div class="tip">先保存 URL / Key / 模型；在作业列表点“开始”会自动进入未交作业，在题目页会抓题、调用模型并填选。</div>
@@ -346,6 +347,7 @@
       log('开始只答当前页');
       await answerCurrentPage(false);
     };
+    D.getElementById('cxllm-debug-list').onclick = () => debugWorkList();
     D.getElementById('cxllm-stop').onclick = () => {
       setRunning(false);
       log('已停止', 'warn');
@@ -964,21 +966,43 @@
     return '';
   }
 
-  function closestRow(el) {
-    let n = el;
-    for (let i = 0; n && i < 9; i++, n = n.parentElement) {
-      const txt = cleanText(n.innerText);
-      const r = n.getBoundingClientRect();
-      if (txt.length >= 6 && r.height >= 24 && r.height <= 260 && /(作业|测试|练习|模拟|判断|单选|多选|期末|章节)/.test(txt)) {
-        return n;
-      }
-    }
-    return el;
+  function workKeywordText(txt) {
+    return /(作业|测试|练习|模拟|判断|单选|多选|期末|章节|导论|第[一二三四五六七八九十\d]+章)/.test(txt);
   }
 
   function unfinishedText(txt) {
     return /(未交|未提交|未完成|未做|待做|待完成|待提交|未答)/.test(txt)
       && !/(已交|已提交|已完成|已批阅|提交成功)/.test(txt);
+  }
+
+  function rowLikeText(txt) {
+    return txt && txt.length >= 4 && txt.length < 1600 && unfinishedText(txt) && workKeywordText(txt)
+      && !/智能分析|大雅相似度/.test(txt);
+  }
+
+  function directClickableCount(el) {
+    if (!el || !el.querySelectorAll) return 0;
+    return Array.from(el.querySelectorAll('a[href],[onclick],button,[role="button"],[tabindex]'))
+      .filter(visible).length;
+  }
+
+  function closestRow(el) {
+    const candidates = [];
+    let n = el;
+    for (let depth = 0; n && depth < 16; depth++, n = n.parentElement) {
+      if (n.closest?.(`#${PANEL_ID}`)) break;
+      const txt = cleanText(n.innerText || n.textContent || '');
+      if (!rowLikeText(txt)) continue;
+      const r = n.getBoundingClientRect();
+      const unfinishedCount = (txt.match(/未交|未提交|未完成|未做|待做|待完成|待提交|未答/g) || []).length;
+      let score = depth * 8 + Math.min(txt.length / 20, 60) + Math.max(0, unfinishedCount - 1) * 35;
+      if (r.height > 0 && r.height <= 180) score -= 35;
+      if (r.width >= 300) score -= 15;
+      if (directClickableCount(n)) score -= 10;
+      candidates.push({ el: n, score, txt });
+    }
+    candidates.sort((a, b) => a.score - b.score);
+    return candidates[0]?.el || el;
   }
 
   function findWorkTarget(row) {
@@ -991,10 +1015,8 @@
 
   function pushWorkCandidate(cands, row, preferredTarget = null) {
     if (!row || !visible(row)) return;
-    const txt = cleanText(row.innerText);
-    if (!unfinishedText(txt)) return;
-    if (!/(作业|测试|练习|模拟|判断|单选|多选|期末|章节)/.test(txt)) return;
-    if (/智能分析|大雅相似度/.test(txt)) return;
+    const txt = cleanText(row.innerText || row.textContent || '');
+    if (!rowLikeText(txt)) return;
     const target = preferredTarget || findWorkTarget(row);
     if (!target) return;
     cands.push({ el: target, row, text: txt, url: workUrlFrom(target) || workUrlFrom(row) });
@@ -1009,27 +1031,56 @@
       pushWorkCandidate(cands, closestRow(el), el);
     }
 
-    const statusLeaves = Array.from(D.querySelectorAll('body span,body div,body p,body li,body td'))
-      .filter(visible)
+    const statusLeaves = Array.from(D.querySelectorAll('body *'))
+      .filter(el => !el.closest(`#${PANEL_ID}`))
       .filter(el => {
-        const txt = cleanText(el.innerText);
-        return txt.length > 0 && txt.length < 120 && unfinishedText(txt);
+        const txt = cleanText(el.innerText || el.textContent || '');
+        return txt.length > 0 && txt.length < 180 && unfinishedText(txt);
       });
     for (const leaf of statusLeaves) {
       pushWorkCandidate(cands, closestRow(leaf));
     }
 
-    const rowLike = Array.from(D.querySelectorAll('li,tr,[class*="work"],[class*="Work"],[class*="task"],[class*="Task"],[class*="item"],[class*="Item"]'))
-      .filter(visible)
-      .filter(el => {
-        const txt = cleanText(el.innerText);
-        return txt.length >= 4 && txt.length < 1200 && unfinishedText(txt);
-      });
-    for (const row of rowLike) {
-      pushWorkCandidate(cands, row);
+    const textWalker = D.createTreeWalker(D.body, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        const parent = node.parentElement;
+        if (!parent || parent.closest(`#${PANEL_ID}`)) return NodeFilter.FILTER_REJECT;
+        const txt = cleanText(node.nodeValue || '');
+        if (!txt || (!unfinishedText(txt) && !workKeywordText(txt))) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    let node;
+    while ((node = textWalker.nextNode())) {
+      pushWorkCandidate(cands, closestRow(node.parentElement));
     }
 
-    return uniqBy(cands, c => c.url || cssPath(c.row)).filter(c => !/智能分析|大雅相似度/.test(c.text));
+    const broadRows = Array.from(D.querySelectorAll('body li,body tr,body div,body section,body article'))
+      .filter(el => !el.closest(`#${PANEL_ID}`))
+      .filter(visible)
+      .filter(el => rowLikeText(cleanText(el.innerText || el.textContent || '')));
+    for (const row of broadRows) {
+      pushWorkCandidate(cands, closestRow(row));
+    }
+
+    return uniqBy(cands, c => c.url || cssPath(c.row)).sort((a, b) => a.text.length - b.text.length);
+  }
+
+  function debugWorkList() {
+    const bodyText = cleanText(D.body?.innerText || '');
+    const works = collectUnfinishedWorks();
+    log(`诊断：body含未交=${unfinishedText(bodyText)}，候选=${works.length}`, works.length ? 'ok' : 'warn');
+    works.slice(0, 8).forEach((w, i) => {
+      log(`候选#${i + 1}: ${w.text.replace(/\n/g, ' ').slice(0, 160)} | url=${w.url || 'none'}`);
+    });
+    if (!works.length) {
+      const samples = Array.from(D.querySelectorAll('body *'))
+        .filter(el => !el.closest(`#${PANEL_ID}`))
+        .map(el => cleanText(el.innerText || el.textContent || ''))
+        .filter(txt => txt && txt.length < 220 && (/未交|期末|作业|章节|模拟|多选|判断/.test(txt)))
+        .slice(0, 12);
+      samples.forEach((txt, i) => log(`样本文本#${i + 1}: ${txt.replace(/\n/g, ' ').slice(0, 180)}`, 'warn'));
+    }
   }
 
   async function waitForUnfinishedWorks(timeoutMs = 10000) {
