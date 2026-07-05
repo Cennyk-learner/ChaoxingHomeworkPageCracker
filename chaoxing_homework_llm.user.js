@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.9
+// @version      1.0.10
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -968,7 +968,7 @@
       }
     };
     add(findChaoxingOptionLi(q, label, text));
-    add(findVisualOptionByPosition(q, label, text));
+    visualOptionClickTargets(q, label, text).forEach(add);
     add(opt.el);
     if (root?.querySelectorAll) {
       const nodes = Array.from(root.querySelectorAll('input,li,label,a,button,span,div,em,[id-param],[val-param]'))
@@ -1064,6 +1064,52 @@
     return scored[0]?.target || null;
   }
 
+  function elementFromCenter(el, dx = 0, dy = 0) {
+    const r = el?.getBoundingClientRect?.();
+    if (!r) return null;
+    const x = Math.max(1, Math.min(W.innerWidth - 1, r.left + r.width / 2 + dx));
+    const y = Math.max(1, Math.min(W.innerHeight - 1, r.top + r.height / 2 + dy));
+    return D.elementFromPoint(x, y);
+  }
+
+  function visualOptionClickTargets(q, label, text = '') {
+    const l = String(label || '').toUpperCase();
+    const wantText = cleanText(text || optionTextForLabel(q?.typeText, l));
+    const wantNorm = norm(wantText);
+    const { top, bottom } = optionVerticalBounds(q);
+    const found = [];
+    const pushAround = el => {
+      if (!el || !visible(el) || el.closest?.(`#${PANEL_ID}`)) return;
+      const container = optionContainerAround(el, l, wantText);
+      found.push(el, container, el.parentElement, container?.parentElement, elementFromCenter(el), elementFromCenter(container));
+      const er = el.getBoundingClientRect?.();
+      if (er) found.push(D.elementFromPoint(Math.max(1, er.left + 8), Math.max(1, er.top + er.height / 2)));
+      const cr = container?.getBoundingClientRect?.();
+      if (cr) found.push(D.elementFromPoint(Math.max(1, cr.left + 24), Math.max(1, cr.top + cr.height / 2)));
+    };
+    pushAround(findChaoxingOptionLi(q, l, wantText));
+    pushAround(findVisualOptionByPosition(q, l, wantText));
+    const nodes = Array.from(D.querySelectorAll('li,label,button,a,span,div,em,i,b'))
+      .filter(el => !el.closest(`#${PANEL_ID}`))
+      .filter(visible)
+      .map(el => ({ el, rect: el.getBoundingClientRect(), txt: cleanText(el.innerText || el.textContent || el.value || '') }))
+      .filter(x => x.rect.top >= top && x.rect.top < bottom && x.rect.height > 0 && x.rect.height <= 100 && x.rect.width > 0 && x.txt.length > 0 && x.txt.length <= 160)
+      .map(x => {
+        const nt = norm(x.txt);
+        let score = 100;
+        if (x.txt.trim().toUpperCase() === l || optionLabelFromElement(x.el) === l) score -= 80;
+        if (wantNorm && nt === wantNorm) score -= 70;
+        if (wantNorm && nt && (nt.includes(wantNorm) || wantNorm.includes(nt))) score -= 25;
+        score += Math.min(x.txt.length, 80);
+        return { ...x, score };
+      })
+      .filter(x => x.score < 100)
+      .sort((a, b) => a.score - b.score)
+      .slice(0, 6);
+    nodes.forEach(x => pushAround(x.el));
+    return uniqBy(found.filter(Boolean).filter(el => visible(el) && !el.closest?.(`#${PANEL_ID}`)), cssPath);
+  }
+
   function optionAnswerValue(q, opt) {
     const label = String(opt?.label || '').toUpperCase();
     const val = String(opt?.el?.getAttribute?.('val-param') || opt?.val || '').toLowerCase();
@@ -1143,7 +1189,6 @@
       changed = true;
     }
 
-    if (target) changed = markVisualPicked(q, opt, target) || changed;
     return changed;
   }
 
@@ -1157,9 +1202,15 @@
       view: W,
       clientX: rect ? rect.left + rect.width / 2 : 0,
       clientY: rect ? rect.top + rect.height / 2 : 0,
-      button: 0
+      screenX: rect ? rect.left + rect.width / 2 + W.screenX : 0,
+      screenY: rect ? rect.top + rect.height / 2 + W.screenY : 0,
+      button: 0,
+      buttons: 1,
+      pointerId: 1,
+      pointerType: 'mouse',
+      isPrimary: true
     };
-    for (const type of ['pointerdown', 'mousedown', 'mouseup', 'pointerup', 'click']) {
+    for (const type of ['mouseover', 'mousemove', 'pointerover', 'pointerenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
       try {
         const Evt = type.startsWith('pointer') && typeof W.PointerEvent === 'function' ? W.PointerEvent : W.MouseEvent;
         el.dispatchEvent(new Evt(type, eventInit));
@@ -1199,7 +1250,7 @@
 
   function optionConfirmed(q, opt, target) {
     const concrete = findChaoxingOptionLi(q, opt?.label, opt?.text) || findVisualOptionByPosition(q, opt?.label, opt?.text) || opt?.el;
-    return isSelected(concrete) || isSelected(opt?.el) || isSelected(target) || optionValueConfirmed(q, { ...opt, el: concrete });
+    return optionValueConfirmed(q, { ...opt, el: concrete }) || isSelected(concrete) || isSelected(opt?.el) || isSelected(target);
   }
 
   async function clickOption(opt, q) {
@@ -1211,15 +1262,15 @@
     const targets = optionClickTargets(opt, q);
     for (const target of targets) {
       dispatchClick(target);
-      for (let i = 0; i < 8; i++) {
-        await sleep(90);
+      for (let i = 0; i < 2; i++) {
+        await sleep(35);
         if (optionConfirmed(q, opt, target)) return true;
       }
       const after = answerStateSignature(root);
       if (after && after !== before && optionConfirmed(q, opt, target)) return true;
     }
     // 兜底：部分新版学习通页面把选项做成自定义组件，普通 click 不改变 DOM。
-    // 这里按原脚本思路直接写入 radio/hidden answer，并给选项容器打选中态，避免“匹配到了但没填上”。
+    // 这里只写真实 radio/checkbox/answer 字段；不再伪造可见选中态，避免误判成功。
     if (forceSetAnswer(q, opt)) {
       await sleep(80);
       if (optionConfirmed(q, opt, opt.el)) return true;
@@ -1354,6 +1405,10 @@
         byId.set(id, a);
       });
       for (let i = 0; i < batch.length; i++) {
+        if (!isRunning() && allowAfterAction) {
+          log('运行已停止，退出当前批次', 'warn');
+          break;
+        }
         const q = batch[i];
         const a = byId.get(q.id) || answers[i] || {};
         const ans = a.answer ?? a.answers ?? a.option ?? a.result ?? '';
@@ -1828,12 +1883,44 @@
     await enterNextWork();
   }
 
+  function debugQuestion(index = 1) {
+    const q = extractQuestions()[Number(index) - 1];
+    if (!q) return null;
+    const scopes = uniqBy([q.root, q.root?.parentElement, q.root?.parentElement?.parentElement].filter(Boolean), cssPath);
+    const labels = q.options.length ? q.options.map(o => o.label).filter(Boolean) : ['A', 'B', 'C', 'D'];
+    const candidates = [];
+    for (const label of labels) {
+      const text = q.options.find(o => o.label === label)?.text || optionTextForLabel(q.typeText, label);
+      visualOptionClickTargets(q, label, text).slice(0, 10).forEach(el => candidates.push({
+        label,
+        tag: el.tagName,
+        cls: String(el.className || '').slice(0, 80),
+        text: cleanText(el.innerText || el.textContent || el.value || '').slice(0, 80),
+        path: cssPath(el)
+      }));
+    }
+    const inputs = uniqBy(scopes.flatMap(scope => Array.from(scope.querySelectorAll?.('input,textarea,select') || [])), cssPath)
+      .map(el => ({
+        tag: el.tagName,
+        type: el.type || '',
+        name: el.name || '',
+        id: el.id || '',
+        value: String(el.value || '').slice(0, 80),
+        checked: !!el.checked,
+        path: cssPath(el)
+      }));
+    const data = { id: q.id, index: q.index, type: q.typeText, question: q.question, key: questionKey(q), options: q.options.map(o => ({ label: o.label, text: o.text, val: o.val })), candidates, inputs };
+    console.log('[CX-LLM] debugQuestion', data);
+    return data;
+  }
+
   function exposeApi() {
     W.__chaoxingHomeworkLLM = {
       extractQuestions,
       answerCurrentPage,
       enterNextWork,
       debugWorkList,
+      debugQuestion,
       getCfg,
       setCfg,
       start: async () => { setRunning(true); await runController(); },
