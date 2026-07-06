@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.23
+// @version      1.0.24
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -1352,10 +1352,21 @@
     let changed = false;
     const value = optionAnswerValue(q, { ...opt, el: target || opt?.el });
 
-    const inputScopes = uniqBy([target, target?.parentElement].filter(Boolean), cssPath);
+    // 搜索范围：从 target 向上到 question root，以及 root 自身
+    const inputScopes = uniqBy([target, target?.parentElement, target?.closest?.('li'), opt?.el, opt?.el?.closest?.('li'), q?.root].filter(Boolean), cssPath);
+    const key = questionKey(q);
     for (const scope of inputScopes) {
       const inputs = Array.from(scope.querySelectorAll?.('input[type="radio"],input[type="checkbox"]') || []);
       for (const input of inputs) {
+        const inputName = String(input.name || input.id || '');
+        const inputValue = String(input.value || '').toUpperCase();
+        const nearLabel = optionLabelFromElement(input.closest?.('li,label,span,div') || input);
+        // 在 root 范围时，需要额外验证 input 属于当前选项
+        const isRootScope = scope === q?.root;
+        const matchesOption = inputValue === label || nearLabel === label
+          || (key && inputName.includes(key) && (inputValue === label || inputValue === value))
+          || (target?.contains?.(input));
+        if (isRootScope && !matchesOption) continue;
         setNativeChecked(input, true);
         input.setAttribute('checked', 'checked');
         dispatchInputChange(input);
@@ -1377,7 +1388,6 @@
 
     if (target) {
       markVisualPicked(q, opt, target);
-      // 多选自定义控件常常没有真实 input；只要找到了目标，也要把该项视觉选中并参与后续确认。
       if (q?.typeText === '多选题' || q?.__cxllmForceMulti) changed = true;
     }
     return changed;
@@ -1515,6 +1525,9 @@
     const targets = optionClickTargets(opt, q);
     for (const target of targets) {
       dispatchClick(target);
+      // 如果目标是 <li>，也尝试点击内部的 <a>（许多学习通页面的点击处理绑定在 <a> 上）
+      const innerA = target.matches?.('a') ? null : target.querySelector?.('a');
+      if (innerA) dispatchClick(innerA);
       for (let i = 0; i < 2; i++) {
         await sleep(30);
         if (confirm(q, opt, target)) return true;
@@ -1523,10 +1536,13 @@
       if (after && after !== before && confirm(q, opt, target)) return true;
     }
     // 兜底：部分新版学习通页面把选项做成自定义组件，普通 click 不改变 DOM。
-    // 这里写入真实 radio/checkbox/answer 字段，并补一个纯展示用的选中态，避免“填上了但看不出来”。
+    // 这里写入真实 radio/checkbox/answer 字段，并补一个纯展示用的选中态，避免”填上了但看不出来”。
     if (forceSetAnswer(q, opt)) {
       await sleep(80);
       if (optionConfirmed(q, opt, opt.el)) return true;
+      // forceSetAnswer 成功写入了 radio/answer 值，即使 UI 确认失败也视为成功
+      // （某些页面变体的隐藏 input 就是实际提交机制，不依赖 CSS 选中态）
+      if (answerStateSignature(root) !== before) return true;
     }
     return false;
   }
