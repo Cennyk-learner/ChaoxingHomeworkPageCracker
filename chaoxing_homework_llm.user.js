@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.22
+// @version      1.0.23
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -1933,10 +1933,15 @@
 
   function workUrlFrom(el) {
     if (!el) return '';
-    const a = el.matches?.('a[href]') ? el : el.querySelector?.('a[href*="work"],a[href*="workId"],a[href*="dowork"]');
-    const href = a?.getAttribute('href') || '';
-    if (href && !/^javascript:/i.test(href)) return new URL(href, location.href).href;
-    const onclick = el.getAttribute?.('onclick') || a?.getAttribute?.('onclick') || '';
+    // 优先查找含 work/workId/dowork 关键词的链接
+    const specificA = el.matches?.('a[href]') ? el : el.querySelector?.('a[href*="work"],a[href*="workId"],a[href*="dowork"]');
+    const specificHref = specificA?.getAttribute('href') || '';
+    if (specificHref && !/^javascript:/i.test(specificHref)) return new URL(specificHref, location.href).href;
+    // 兜底：任意可见的 <a href> 链接（排除锚点和 javascript:）
+    const anyA = el.matches?.('a[href]') ? el : el.querySelector?.('a[href]');
+    const anyHref = anyA?.getAttribute('href') || '';
+    if (anyHref && !/^(javascript:|#)/i.test(anyHref)) return new URL(anyHref, location.href).href;
+    const onclick = el.getAttribute?.('onclick') || specificA?.getAttribute?.('onclick') || anyA?.getAttribute?.('onclick') || '';
     const m = onclick.match(/https?:\/\/[^'")\s]+|\/[^'")\s]+(?:work|dowork|workId)[^'")\s]*/i);
     if (m) return new URL(m[0], location.href).href;
     return '';
@@ -1952,8 +1957,11 @@
   }
 
   function rowLikeText(txt) {
-    return txt && txt.length >= 4 && txt.length < 1600 && unfinishedText(txt) && workKeywordText(txt)
-      && !/智能分析|大雅相似度/.test(txt);
+    if (!txt || txt.length < 4 || txt.length >= 1600) return false;
+    if (/智能分析|大雅相似度/.test(txt)) return false;
+    if (!unfinishedText(txt)) return false;
+    // 有"未交"等状态标记的行即为候选，不强制要求包含"作业/测试/第X章"关键词
+    return true;
   }
 
   function directClickableCount(el) {
@@ -2022,7 +2030,7 @@
   function collectUnfinishedWorks() {
     const cands = [];
     const clickables = Array.from(D.querySelectorAll(
-      'a[href*="work"],a[href*="workId"],a[href*="dowork"],[onclick*="work"],[onclick*="Work"],[onclick*="workId"],[onclick*="dowork"]'
+      'a[href*="work"],a[href*="workId"],a[href*="dowork"],a[href*="Work"],[onclick*="work"],[onclick*="Work"],[onclick*="workId"],[onclick*="dowork"]'
     )).filter(visible);
     for (const el of clickables) {
       pushWorkCandidate(cands, closestRow(el), el);
@@ -2112,12 +2120,16 @@
         const beforeWorks = collectUnfinishedWorks();
         const first = beforeWorks[0] || null;
         const clicked = await enterNextWork({ stopOnMiss: false, frameFallback: false, clickFilter: true });
+        // 点击后重新采集一次 URL，因为 activateWorkCandidate 可能触发了新的链接解析
+        const afterWorks = collectUnfinishedWorks();
+        const firstUrl = first?.url || '';
+        const afterUrl = afterWorks[0]?.url || '';
         reply({
           href: location.href,
           clicked,
-          targetUrl: first?.url || '',
+          targetUrl: firstUrl || afterUrl,
           targetText: first?.text || '',
-          works: summarizeWorksForBridge()
+          works: (afterWorks.length ? afterWorks : beforeWorks).slice(0, 12).map(w => ({ text: w.text, url: w.url || '' }))
         });
       }
     });
@@ -2148,22 +2160,43 @@
   }
 
   function clickUnfinishedFilter() {
-    const controls = Array.from(D.querySelectorAll('label,span,div,a,button,input,[role="radio"],[role="button"]'))
+    const controls = Array.from(D.querySelectorAll('label,span,div,a,button,input,[role=”radio”],[role=”button”],[role=”tab”]'))
       .filter(el => !el.closest(`#${PANEL_ID}`))
       .filter(visible)
       .filter(el => {
         const txt = cleanText(el.value || el.innerText || el.textContent || el.getAttribute('aria-label') || '');
-        return txt === '未完成' || /(^|\s)未完成($|\s)/.test(txt);
+        return txt === '未完成' || txt === '未交' || /(^|\s)(未完成|未交)($|\s)/.test(txt);
       });
     for (const el of controls) {
       const target = el.closest('label') || el;
       humanClick(target);
-      const input = target.querySelector?.('input[type="radio"],input[type="checkbox"]')
-        || el.querySelector?.('input[type="radio"],input[type="checkbox"]')
+      const input = target.querySelector?.('input[type=”radio”],input[type=”checkbox”]')
+        || el.querySelector?.('input[type=”radio”],input[type=”checkbox”]')
         || (el.previousElementSibling?.matches?.('input') ? el.previousElementSibling : null)
         || (el.nextElementSibling?.matches?.('input') ? el.nextElementSibling : null);
-      if (input) humanClick(input);
-      log('已点击“未完成”筛选');
+      if (input) {
+        setNativeChecked(input, true);
+        humanClick(input);
+        dispatchInputChange(input);
+      }
+      log('已点击”未完成”筛选');
+      return true;
+    }
+    // 兜底：查找 radio input[value] 和相邻 label
+    const radios = Array.from(D.querySelectorAll('input[type=”radio”]'))
+      .filter(el => !el.closest(`#${PANEL_ID}`))
+      .filter(el => {
+        const label = el.closest('label') || D.querySelector(`label[for=”${el.id}”]`);
+        const txt = cleanText(label?.innerText || label?.textContent || '');
+        return txt === '未完成' || txt === '未交';
+      });
+    for (const radio of radios) {
+      setNativeChecked(radio, true);
+      humanClick(radio);
+      dispatchInputChange(radio);
+      const label = radio.closest('label') || D.querySelector(`label[for=”${radio.id}”]`);
+      if (label) humanClick(label);
+      log('已点击”未完成”筛选(radio)');
       return true;
     }
     return false;
@@ -2250,21 +2283,47 @@
     const { stopOnMiss = true, frameFallback = IS_TOP, clickFilter = true } = options;
     if (clickFilter) {
       const clickedFilter = clickUnfinishedFilter();
-      if (clickedFilter) await sleep(900);
-      if (IS_TOP) await requestFrames('click-unfinished', {}, 1200);
+      if (IS_TOP) {
+        const filterResults = await requestFrames('click-unfinished', {}, 1200);
+        const anyFilterClicked = clickedFilter || filterResults.some(r => r.clicked);
+        if (anyFilterClicked) {
+          log('已触发未完成筛选，等待列表刷新');
+          await sleep(2000);
+        }
+      } else if (clickedFilter) {
+        await sleep(900);
+      }
     }
     if (clickStartButtonIfPresent()) return true;
     const works = await waitForUnfinishedWorks();
     if (!works.length && frameFallback) {
-      const frameResults = await requestFrames('enter-next', {}, 5000);
+      const frameResults = await requestFrames('enter-next', {}, 8000);
       const hit = frameResults.find(r => r.clicked);
       if (hit) {
-        const targetUrl = hit.targetUrl || hit.works?.[0]?.url || '';
+        let targetUrl = hit.targetUrl || hit.works?.[0]?.url || '';
         log(`iframe已处理作业：${(hit.targetText || hit.works?.[0]?.text || hit.href || '').replace(/\n/g, ' ').slice(0, 120)}`, targetUrl ? 'ok' : 'warn');
+        // iframe 点击后可能需要等待内部跳转完成，再次查询 URL
+        if (!targetUrl) {
+          await sleep(2000);
+          const retryResults = await requestFrames('debug-list', {}, 3000);
+          for (const r of retryResults) {
+            const w = (r.works || []).find(x => x.url);
+            if (w?.url) { targetUrl = w.url; break; }
+          }
+        }
         markPendingContinue();
         if (targetUrl) {
           log('使用 iframe 返回的作业 URL 在顶层跳转', 'ok');
           location.href = targetUrl;
+        } else {
+          // iframe 已点击但无法获取 URL，等待 iframe 内部完成导航
+          log('iframe 已点击作业但未返回 URL，等待 iframe 内页面加载', 'warn');
+          await sleep(3000);
+          // 检查 iframe 内是否已加载题目页
+          const checkResults = await requestFrames('debug-list', {}, 2000);
+          if (!checkResults.length) {
+            log('iframe 可能已导航离开，等待新页面加载', 'warn');
+          }
         }
         return true;
       }
@@ -2285,7 +2344,7 @@
     if (!w.url && activated) {
       await sleep(1200);
       if (location.href === beforeHref && !extractQuestions().length) {
-        log('已点击作业行/标题，但当前框架还未跳转；如仍停留列表，请点“诊断列表”发候选信息。', 'warn');
+        log('已点击作业行/标题，但当前框架还未跳转；如仍停留列表，请点”诊断列表”发候选信息。', 'warn');
       }
     }
     return true;
