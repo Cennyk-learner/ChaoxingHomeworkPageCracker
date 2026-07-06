@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通作业 LLM 自动答题助手（独立版）
 // @namespace    ctf-chaoxing-homework-llm
-// @version      1.0.21
+// @version      1.0.22
 // @description  独立完成学习通/超星作业页面题目抓取、Codex/OpenAI兼容或Claude接口答题、自动填选、可选保存/提交。
 // @author       Moyin/Codex
 // @run-at       document-end
@@ -588,7 +588,11 @@
     }
     return uniqBy(roots, el => cssPath(el)).filter(root => {
       const t = cleanText(root.innerText);
-      return t && t.length < 8000;
+      if (!t || t.length >= 8000) return false;
+      // 过滤掉包含其他题目根元素的大节标题（如"一. 多选题（共20题，32分）"）
+      const otherRoots = roots.filter(r => r !== root && root.contains(r));
+      if (otherRoots.length >= 2) return false;
+      return true;
     });
   }
 
@@ -910,7 +914,7 @@
   function extractQuestions() {
     const roots = getQuestionRoots();
     const questions = [];
-    roots.forEach((root, i) => {
+    roots.forEach((root) => {
       const typeText = inferType(root);
       let options = extractOptionsFromRoot(root);
       if (!options.length) options = inlineOptionsFromText(root, typeText);
@@ -919,12 +923,12 @@
       let id = root.getAttribute('data-questionid') || root.getAttribute('qid') || '';
       const ansInput = Array.from(root.querySelectorAll('input[name*="answer"],input[id*="answer"]')).find(x => x.name || x.id);
       if (!id && ansInput) id = ansInput.name || ansInput.id;
-      if (!id) id = String(i + 1);
-      questions.push({ id: String(id), index: i + 1, root, typeText, question, options, inputs: textInputs(root) });
+      questions.push({ id: id || '', index: 0, root, typeText, question, options, inputs: textInputs(root) });
     });
     const unique = uniqBy(questions, q => `${q.id}:${norm(q.question).slice(0, 80)}`);
     unique.forEach((q, idx) => {
       q.index = idx + 1;
+      if (!q.id) q.id = String(idx + 1);
       q.nextRoot = unique[idx + 1]?.root || null;
     });
     return unique;
@@ -1487,8 +1491,14 @@
   async function ensureTopBeforeFirstFill(q) {
     log('填第一题前回到题页顶部');
     try { W.scrollTo({ top: 0, left: 0, behavior: 'instant' }); } catch (_) { try { W.scrollTo(0, 0); } catch (__) {} }
-    for (const el of scrollableContainersFor(q?.root)) {
+    // 只滚动文档级容器和题目根元素的直接祖先，避免误触侧边栏导航面板
+    for (const el of [D.scrollingElement, D.documentElement, D.body].filter(Boolean)) {
       try { el.scrollTop = 0; el.scrollLeft = 0; } catch (_) {}
+    }
+    for (let n = q?.root?.parentElement; n; n = n.parentElement) {
+      try {
+        if (n.scrollHeight > n.clientHeight + 80) { n.scrollTop = 0; }
+      } catch (_) {}
     }
     await sleep(120);
     try { q?.root?.scrollIntoView({ block: 'start', inline: 'nearest' }); } catch (_) {}
